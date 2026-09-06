@@ -1,0 +1,988 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -3,6 +3,7 @@
+ """Inference-only Qwen3-Next/Qwen3.5 model."""
+ 
+ import os
++from dataclasses import replace
+ from typing import Literal
+ 
+ import torch
+@@ -23,6 +24,7 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+ from vllm.model_executor.layers.layernorm import RMSNormGated
++from vllm.model_executor.layers.mamba.gdn import replay
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+     MergedColumnParallelLinear,
+@@ -348,6 +350,11 @@
+ 
+ @PluggableLayer.register("qwen_gated_delta_net_attention")
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
++    def get_kv_cache_spec(self, vllm_config: VllmConfig):
++        spec = super().get_kv_cache_spec(vllm_config)
++        assert spec.num_speculative_blocks == 3 and spec.mamba_cache_mode == "align"
++        return replace(spec, num_speculative_blocks=0)
++
+     def get_state_shape(
+         self,
+     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+@@ -508,6 +515,7 @@
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
++        replay.init_layer(self)
+ 
+     def _fused_gdn_decode_unsupported_reason(
+         self, vllm_config: VllmConfig
+@@ -1450,7 +1458,7 @@
+         # 2.1: Process the multi-query part
+         if spec_sequence_masks is not None:
+             core_attn_out_spec, last_recurrent_state = (
+-                fused_sigmoid_gating_delta_rule_update(
++                replay.triton_replay.verify(self.replay_tape,
+                     A_log=self.A_log,
+                     a=a_spec,
+                     b=b_spec,
+@@ -1752,30 +1760,7 @@
+         core_attn_out: torch.Tensor,
+         attn_metadata: GDNAttentionMetadata,
+     ) -> None:
+-        state_indices = attn_metadata.spec_state_indices_tensor
+-        cu_seqlens = attn_metadata.spec_query_start_loc
+-        num_accepted_tokens = attn_metadata.num_accepted_tokens
+-        assert state_indices is not None
+-        assert cu_seqlens is not None
+-        assert num_accepted_tokens is not None
+-
+-        num_requests = attn_metadata.num_spec_decodes
+-        ops.fused_gdn_decode_post_conv_mtp(
+-            mixed_qkv=mixed_qkv,
+-            a=a,
+-            b=b,
+-            A_log=self.A_log,
+-            dt_bias=self.dt_bias,
+-            state_indices=state_indices[:num_requests],
+-            cu_seqlens=cu_seqlens[: num_requests + 1],
+-            num_accepted_tokens=num_accepted_tokens[:num_requests],
+-            state=self.kv_cache[1],
+-            output_gate=output_gate,
+-            norm_weight=self.norm.weight,
+-            out=core_attn_out,
+-            scale=self.head_k_dim**-0.5,
+-            norm_eps=self.layer_norm_epsilon,
+-        )
++        replay.forward(self, mixed_qkv, b, a, output_gate, core_attn_out, attn_metadata)
+ 
+     def _forward_core_fused_norm_packed(
+         self,
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/replay.cu
+@@ -0,0 +1,437 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ */
++
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++
++// Experiment derived from vLLM ba07e4a48. FP32 state, H=16, HV=48.
++
++namespace {
++
++template <typename StateT>
++__device__ __forceinline__ void cp_async_16b(StateT* smem_ptr,
++                                             const StateT* gmem_ptr) {
++  const uint32_t smem_addr =
++      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
++  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
++               :
++               : "r"(smem_addr), "l"(gmem_ptr));
++}
++
++__device__ __forceinline__ void cp_async_commit() {
++  asm volatile("cp.async.commit_group;\n" ::);
++}
++
++__device__ __forceinline__ void cp_async_wait_all() {
++  asm volatile("cp.async.wait_all;\n" ::: "memory");
++}
++
++template <typename StateT, int ChunkV, int DimK, int Stages>
++__device__ __forceinline__ void copy_state_chunk(StateT* shared_state,
++                                                 const StateT* state, int chunk,
++                                                 int thread, int threads) {
++  constexpr int kElementsPerCopy = 16 / sizeof(StateT);
++  constexpr int kCopiesPerChunk = ChunkV * DimK / kElementsPerCopy;
++  const int stage = chunk % Stages;
++  for (int copy = thread; copy < kCopiesPerChunk; copy += threads) {
++    const int element = copy * kElementsPerCopy;
++    cp_async_16b(shared_state + stage * ChunkV * DimK + element,
++                 state + chunk * ChunkV * DimK + element);
++  }
++  cp_async_commit();
++}
++
++template <typename StateT>
++__device__ __forceinline__ float4 load_state4(const StateT* state);
++
++template <>
++__device__ __forceinline__ float4 load_state4<float>(const float* state) {
++  return *reinterpret_cast<const float4*>(state);
++}
++
++template <typename StateT>
++__device__ __forceinline__ void store_state4(StateT* state, float4 value);
++
++template <>
++__device__ __forceinline__ void store_state4<float>(float* state,
++                                                    float4 value) {
++  *reinterpret_cast<float4*>(state) = value;
++}
++
++constexpr int kDimK = 128;
++constexpr int kDimV = 128;
++constexpr int kThreads = 256;
++constexpr int kWarps = kThreads / 32;
++constexpr int kChunkV = 32;
++constexpr int kNumChunks = kDimV / kChunkV;
++constexpr int kRowsPerWarp = kChunkV / kWarps;
++constexpr int kMaxMtpTokens = 8;
++constexpr int kDtBiasBFloat16 = 1;
++constexpr int kDtBiasFloat16 = 2;
++
++struct GdnDecodeStrides {
++  int64_t mixed_row;
++  int64_t a_row;
++  int64_t b_row;
++  int64_t gate_row;
++  int64_t state_slot;
++};
++
++__device__ __forceinline__ float sigmoid_fast(float x) {
++  return 1.0f / (1.0f + __expf(-x));
++}
++
++__device__ __forceinline__ float silu_fast(float x) {
++  return x * sigmoid_fast(x);
++}
++
++__device__ __forceinline__ float softplus_fast(float x) {
++  return x > 20.0f ? x : log1pf(__expf(x));
++}
++
++__device__ __forceinline__ float load_dt_bias(const void* dt_bias, int head,
++                                              int dt_bias_type) {
++  if (dt_bias_type == kDtBiasBFloat16) {
++    return __bfloat162float(static_cast<const __nv_bfloat16*>(dt_bias)[head]);
++  }
++  if (dt_bias_type == kDtBiasFloat16) {
++    return __half2float(static_cast<const __half*>(dt_bias)[head]);
++  }
++  return static_cast<const float*>(dt_bias)[head];
++}
++
++__device__ __forceinline__ float warp_reduce_sum(float value) {
++#pragma unroll
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    value += __shfl_xor_sync(0xffffffffu, value, offset);
++  }
++  return value;
++}
++
++struct Sum2 {
++  float x;
++  float y;
++};
++
++__device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
++#pragma unroll
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    x += __shfl_xor_sync(0xffffffffu, x, offset);
++    y += __shfl_xor_sync(0xffffffffu, y, offset);
++  }
++  return {x, y};
++}
++
++template <typename StateT, int ValueHeadsPerKeyHead, int Mode>
++__global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
++    const __nv_bfloat16* __restrict__ mixed_qkv,
++    const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
++    const float* __restrict__ a_log, const void* __restrict__ dt_bias,
++    const int* __restrict__ state_indices, const int* __restrict__ cu_seqlens,
++    const int* __restrict__ num_accepted_tokens, StateT* __restrict__ state,
++    const __nv_bfloat16* __restrict__ output_gate,
++    const void* __restrict__ norm_weight, __nv_bfloat16* __restrict__ out,
++    int H, int HV, int state_indices_width, int dt_bias_type,
++    bool norm_weight_is_bf16, float scale, float norm_eps,
++    GdnDecodeStrides strides, __nv_bfloat16* tape,
++    const int* checkpoint_after, int tape_width) {
++  const int request = blockIdx.x;
++  const int value_head = blockIdx.y;
++  const int tid = threadIdx.x;
++  const int lane = tid & 31;
++  const int warp = tid >> 5;
++  const int start = cu_seqlens[request];
++  const int available = cu_seqlens[request + 1] - start;
++  const int accepted = num_accepted_tokens[request];
++  if (available <= 0) return;
++  const int checkpoint = checkpoint_after[request];
++  const int num_tokens = Mode == 2 ? accepted - 1 : available;
++  const int bos = Mode == 2 ? request * 4 + 1 : start;
++  if constexpr (Mode == 2) {
++    if (accepted < 1 || accepted > available) return;
++    if (accepted == 1 && checkpoint != 1) return;
++  }
++  const int source_slot =
++      Mode == 0
++          ? (accepted > 0 && accepted <= state_indices_width
++                 ? state_indices[request * state_indices_width + accepted - 1] : 0)
++          : state_indices[request * state_indices_width];
++  if constexpr (Mode == 2) {
++    if (source_slot <= 0) return;
++  }
++  if (source_slot <= 0 || num_tokens > kMaxMtpTokens) {
++    for (int linear = tid; linear < num_tokens * kDimV; linear += kThreads) {
++      const int token = bos + linear / kDimV;
++      const int value = linear % kDimV;
++      const int64_t out_offset =
++          (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
++      out[out_offset] = __float2bfloat16(0.0f);
++    }
++    return;
++  }
++
++  const int key_head = value_head / ValueHeadsPerKeyHead;
++  __shared__ StateT shared_state[2][kChunkV][kDimK];
++  __shared__ float shared_q[kMaxMtpTokens][kDimK];
++  __shared__ float shared_k[kMaxMtpTokens][kDimK];
++  __shared__ __nv_bfloat16 shared_v[kMaxMtpTokens][kDimV];
++  __shared__ __nv_bfloat16 shared_out[kMaxMtpTokens][kDimV];
++  __shared__ float shared_decay[kMaxMtpTokens];
++  __shared__ float shared_beta[kMaxMtpTokens];
++
++  StateT* source_state =
++      state + static_cast<int64_t>(source_slot) * strides.state_slot +
++      value_head * kDimV * kDimK;
++  copy_state_chunk<StateT, kChunkV, kDimK, 2>(&shared_state[0][0][0],
++                                              source_state, 0, tid, kThreads);
++
++  if (warp < num_tokens) {
++    const int t = warp;
++    const int token = bos + t;
++    const int64_t mixed_base = static_cast<int64_t>(token) * strides.mixed_row;
++    float q_values[4];
++    float k_values[4];
++    float q_square = 0.0f;
++    float k_square = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const int dim = lane + i * 32;
++      q_values[i] =
++          __bfloat162float(mixed_qkv[mixed_base + key_head * kDimK + dim]);
++      k_values[i] = __bfloat162float(
++          mixed_qkv[mixed_base + H * kDimK + key_head * kDimK + dim]);
++      shared_v[t][dim] =
++          mixed_qkv[mixed_base + 2 * H * kDimK + value_head * kDimV + dim];
++      if constexpr (Mode == 1) {
++        const int tape_base = (request * 4 + t) * tape_width;
++        if (value_head % ValueHeadsPerKeyHead == 0) {
++          tape[tape_base + key_head * kDimK + dim] = mixed_qkv[mixed_base + key_head * kDimK + dim];
++          tape[tape_base + H * kDimK + key_head * kDimK + dim] = mixed_qkv[mixed_base + H * kDimK + key_head * kDimK + dim];
++        }
++        tape[tape_base + 2 * H * kDimK + value_head * kDimV + dim] = shared_v[t][dim];
++      }
++      q_square += q_values[i] * q_values[i];
++      k_square += k_values[i] * k_values[i];
++    }
++    const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
++    const float q_scale = __shfl_sync(
++        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
++    const float k_scale = __shfl_sync(
++        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const int dim = lane + i * 32;
++      shared_q[t][dim] = q_values[i] * q_scale;
++      shared_k[t][dim] = k_values[i] * k_scale;
++    }
++    if (lane == 0) {
++      const float a_value = __bfloat162float(
++          a[static_cast<int64_t>(token) * strides.a_row + value_head]);
++      const float b_value = __bfloat162float(
++          b[static_cast<int64_t>(token) * strides.b_row + value_head]);
++      const float g = -__expf(a_log[value_head]) *
++                      softplus_fast(a_value + load_dt_bias(dt_bias, value_head,
++                                                           dt_bias_type));
++      shared_decay[t] = __expf(g);
++      shared_beta[t] = sigmoid_fast(b_value);
++      if constexpr (Mode == 1) {
++        const int tape_base = (request * 4 + t) * tape_width + 2 * H * kDimK + HV * kDimV;
++        tape[tape_base + value_head] = a[static_cast<int64_t>(token) * strides.a_row + value_head];
++        tape[tape_base + HV + value_head] = b[static_cast<int64_t>(token) * strides.b_row + value_head];
++      }
++    }
++  }
++  __syncthreads();
++
++  const int k_base = lane * 4;
++  int rows[kRowsPerWarp];
++#pragma unroll
++  for (int row = 0; row < kRowsPerWarp; ++row) {
++    rows[row] = warp + row * kWarps;
++  }
++
++#pragma unroll
++  for (int chunk = 0; chunk < kNumChunks; ++chunk) {
++    cp_async_wait_all();
++    __syncthreads();
++    if (chunk + 1 < kNumChunks) {
++      copy_state_chunk<StateT, kChunkV, kDimK, 2>(
++          &shared_state[0][0][0], source_state, chunk + 1, tid, kThreads);
++    }
++
++    float h[kRowsPerWarp][4];
++#pragma unroll
++    for (int row = 0; row < kRowsPerWarp; ++row) {
++      const float4 state_value =
++          load_state4(&shared_state[chunk & 1][rows[row]][k_base]);
++      h[row][0] = state_value.x;
++      h[row][1] = state_value.y;
++      h[row][2] = state_value.z;
++      h[row][3] = state_value.w;
++    }
++
++    if constexpr (Mode == 2) {
++      if (checkpoint == 1) {
++        const int slot = state_indices[request * state_indices_width + 1];
++        if (slot > 0) {
++          StateT* target = state + static_cast<int64_t>(slot) * strides.state_slot + value_head * kDimV * kDimK;
++#pragma unroll
++          for (int row = 0; row < kRowsPerWarp; ++row) {
++            const int value = chunk * kChunkV + rows[row];
++            store_state4(target + value * kDimK + k_base,
++                         make_float4(h[row][0], h[row][1], h[row][2], h[row][3]));
++          }
++        }
++      }
++    }
++    for (int t = 0; t < num_tokens; ++t) {
++      const float4 q4 = *reinterpret_cast<const float4*>(&shared_q[t][k_base]);
++      const float4 k4 = *reinterpret_cast<const float4*>(&shared_k[t][k_base]);
++      const float q_values[4] = {q4.x, q4.y, q4.z, q4.w};
++      const float k_values[4] = {k4.x, k4.y, k4.z, k4.w};
++
++      float dot_hk[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll
++      for (int row = 0; row < kRowsPerWarp; ++row) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++          h[row][i] *= shared_decay[t];
++          dot_hk[row] += h[row][i] * k_values[i];
++        }
++      }
++      const Sum2 dot_hk_01 = warp_reduce_sum_pair(dot_hk[0], dot_hk[1]);
++      const Sum2 dot_hk_23 = warp_reduce_sum_pair(dot_hk[2], dot_hk[3]);
++      const float reduced_hk[kRowsPerWarp] = {dot_hk_01.x, dot_hk_01.y,
++                                              dot_hk_23.x, dot_hk_23.y};
++
++      float dot_hq[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll
++      for (int row = 0; row < kRowsPerWarp; ++row) {
++        const int value = chunk * kChunkV + rows[row];
++        const float delta =
++            (__bfloat162float(shared_v[t][value]) - reduced_hk[row]) *
++            shared_beta[t];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++          h[row][i] += k_values[i] * delta;
++          dot_hq[row] += h[row][i] * q_values[i];
++        }
++      }
++      const Sum2 dot_hq_01 = warp_reduce_sum_pair(dot_hq[0], dot_hq[1]);
++      const Sum2 dot_hq_23 = warp_reduce_sum_pair(dot_hq[2], dot_hq[3]);
++      if (Mode != 2 && lane == 0) {
++        shared_out[t][chunk * kChunkV + rows[0]] =
++            __float2bfloat16(dot_hq_01.x);
++        shared_out[t][chunk * kChunkV + rows[1]] =
++            __float2bfloat16(dot_hq_01.y);
++        shared_out[t][chunk * kChunkV + rows[2]] =
++            __float2bfloat16(dot_hq_23.x);
++        shared_out[t][chunk * kChunkV + rows[3]] =
++            __float2bfloat16(dot_hq_23.y);
++      }
++
++      const int destination_slot = Mode == 0
++          ? state_indices[request * state_indices_width + t]
++          : ((Mode == 1 ? t == 0 : t == num_tokens - 1)
++                 ? state_indices[request * state_indices_width] : 0);
++      if (destination_slot > 0) {
++        StateT* destination_state =
++            state +
++            static_cast<int64_t>(destination_slot) * strides.state_slot +
++            value_head * kDimV * kDimK;
++#pragma unroll
++        for (int row = 0; row < kRowsPerWarp; ++row) {
++          const int value = chunk * kChunkV + rows[row];
++          store_state4(destination_state + value * kDimK + k_base,
++                       make_float4(h[row][0], h[row][1], h[row][2], h[row][3]));
++        }
++      }
++      if constexpr (Mode == 2) {
++        if (checkpoint == t + 2) {
++          const int slot = state_indices[request * state_indices_width + 1];
++          if (slot > 0) {
++            StateT* target = state + static_cast<int64_t>(slot) * strides.state_slot + value_head * kDimV * kDimK;
++#pragma unroll
++            for (int row = 0; row < kRowsPerWarp; ++row) {
++              const int value = chunk * kChunkV + rows[row];
++              store_state4(target + value * kDimK + k_base,
++                           make_float4(h[row][0], h[row][1], h[row][2], h[row][3]));
++            }
++          }
++        }
++      }
++    }
++  }
++  __syncthreads();
++
++  if (Mode != 2 && warp < num_tokens) {
++    const int t = warp;
++    float output_values[4];
++    float sum_square = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const int value = lane + i * 32;
++      output_values[i] = __bfloat162float(shared_out[t][value]);
++      sum_square += output_values[i] * output_values[i];
++    }
++    sum_square = warp_reduce_sum(sum_square);
++    const float rstd =
++        rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
++    const int token = bos + t;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const int value = lane + i * 32;
++      const float gate = silu_fast(__bfloat162float(
++          output_gate[static_cast<int64_t>(token) * strides.gate_row +
++                      value_head * kDimV + value]));
++      const float weight =
++          norm_weight_is_bf16
++              ? __bfloat162float(
++                    static_cast<const __nv_bfloat16*>(norm_weight)[value])
++              : static_cast<const float*>(norm_weight)[value];
++      const int64_t out_offset =
++          (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
++      out[out_offset] =
++          __float2bfloat16(output_values[i] * rstd * weight * gate);
++    }
++  }
++}
++
++
++}  // namespace
++
++extern "C" int launch_gdn(
++    int mode, const void* mixed, const void* a, const void* b,
++    const float* a_log, const void* dt_bias, const int* indices,
++    const int* cu, const int* accepted, float* state, const void* gate,
++    const void* norm, void* out, void* tape, const int* checkpoint,
++    int batch, int bias_type, int norm_bf16, int64_t mixed_row,
++    int64_t a_row, int64_t b_row, int64_t gate_row, int64_t state_slot,
++    float scale, float eps, cudaStream_t stream) {
++  constexpr int H = 16, HV = 48, W = 2 * H * 128 + HV * 128 + 2 * HV;
++  if (mode < 0 || mode > 2 || batch < 1 || batch > 2) return cudaErrorInvalidValue;
++  GdnDecodeStrides strides{mixed_row, a_row, b_row, gate_row, state_slot};
++  const auto* mx = static_cast<const __nv_bfloat16*>(mixed);
++  const auto* ax = static_cast<const __nv_bfloat16*>(a);
++  const auto* bx = static_cast<const __nv_bfloat16*>(b);
++  if (mode == 2) {
++    mx = static_cast<const __nv_bfloat16*>(tape);
++    ax = mx + W - 2 * HV;
++    bx = ax + HV;
++    strides.mixed_row = strides.a_row = strides.b_row = W;
++  }
++#define LAUNCH(MODE) gdn_decode_post_conv_mtp_kernel<float, 3, MODE><<<dim3(batch, HV), kThreads, 0, stream>>>( \
++    mx, ax, bx, a_log, dt_bias, indices, cu, accepted, state, \
++    static_cast<const __nv_bfloat16*>(gate), norm, static_cast<__nv_bfloat16*>(out), \
++    H, HV, 4, bias_type, norm_bf16, scale, eps, strides, \
++    static_cast<__nv_bfloat16*>(tape), checkpoint, W)
++  if (mode == 0) { LAUNCH(0); }
++  if (mode == 1) { LAUNCH(1); }
++  if (mode == 2) { LAUNCH(2); }
++#undef LAUNCH
++  return cudaGetLastError();
++}
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/replay.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.mamba.gdn import replay_triton as triton_replay
++
++logger = init_logger(__name__)
++LAYERS, GROUPS, GRAPHS = {}, [], {}
++NATIVE = None
++DUMMY = None
++
++
++def init_layer(self):
++    assert self.num_spec == 3 and self.tp_size == 1
++    assert self.gdn_decode_kernel == 'cuda'
++    assert self.get_state_dtype() == (torch.bfloat16, torch.float32)
++    assert not self.gqa_interleaved_layout and self.conv_kernel_size == 4
++    assert self.num_k_heads == 16 and self.num_v_heads == 48
++    assert self.head_k_dim == self.head_v_dim == 128
++    self.register_buffer('replay_tape', torch.empty((2, 4, 10336),
++                         device=self.A_log.device, dtype=torch.bfloat16), persistent=False)
++    self.replay_calls = {}
++    LAYERS[self.prefix] = self
++
++
++def forward(self, mixed_qkv, b, a, output_gate, core_attn_out, attn_metadata):
++    m = attn_metadata
++    n = m.num_spec_decodes
++    assert 1 <= n <= 2 and m.num_prefills == 0
++    sample = dict(mixed_qkv=mixed_qkv, a=a, b=b, output_gate=output_gate,
++                  A_log=self.A_log, dt_bias=self.dt_bias, norm_weight=self.norm.weight,
++                  norm_eps=self.layer_norm_epsilon)
++    indices, cu = m.spec_state_indices_tensor[:n], m.spec_query_start_loc[:n + 1]
++    accepted = m.num_accepted_tokens[:n]
++    key = (n, self.kv_cache[1].data_ptr(), *(t.data_ptr() for t in [mixed_qkv, a, b, output_gate, core_attn_out, indices, cu, accepted]),
++           mixed_qkv.stride(0), a.stride(0), b.stride(0), output_gate.stride(0))
++    call = self.replay_calls.get(key)
++    if call is None:
++        call = NATIVE.bind(1, sample, indices, cu, accepted, self.kv_cache[1],
++                           core_attn_out, self.replay_tape[:n], accepted)
++        if len(self.replay_calls) > 32:
++            self.replay_calls.clear()
++        self.replay_calls[key] = call
++    call()
++
++
++def init_metadata(self, kv_cache_spec, layer_names, device):
++    assert kv_cache_spec.num_speculative_blocks == 0 and self.num_spec == 3
++    self.replay_names = layer_names
++    self.map_cpu = torch.full((2,), -1, dtype=torch.int32, pin_memory=True)
++    self.length_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
++    for name, shape in [('mapping', (2,)), ('lengths', (2,)), ('indices', (2, 4)),
++                        ('cu', (3,)), ('accepted', (2,)), ('checkpoint', (2,))]:
++        setattr(self, name, torch.zeros(shape, device=device, dtype=torch.int32))
++    self.last = None
++    GROUPS.append(self)
++
++
++def update_metadata(self, meta, drafts, cm):
++    self.last = meta
++    n = meta.num_spec_decodes
++    assert n <= 2
++    self.map_cpu.fill_(-1)
++    self.length_cpu.zero_()
++    if n:
++        indices = (drafts >= 0).nonzero().flatten()
++        assert len(indices) == n
++        self.map_cpu[:n].copy_(indices)
++        self.length_cpu[:n].copy_(cm.query_start_loc_cpu.diff()[indices])
++    self.mapping.copy_(self.map_cpu, non_blocking=True)
++    self.lengths.copy_(self.length_cpu, non_blocking=True)
++    return meta
++
++
++def commit_graphs():
++    assert len(LAYERS) == 48 and sum(len(g.replay_names) for g in GROUPS) == 48
++    for g in GROUPS:
++        g.handles = [LAYERS[name] for name in g.replay_names]
++        g.calls = []
++        for handle in g.handles:
++            tape = handle.replay_tape
++            sample = dict(mixed_qkv=tape.view(8, 10336)[:, :10240],
++                          a=tape.view(8, 10336)[:, 10240:10288], b=tape.view(8, 10336)[:, 10288:],
++                          A_log=handle.A_log, dt_bias=handle.dt_bias, output_gate=DUMMY,
++                          norm_weight=handle.norm.weight, norm_eps=handle.layer_norm_epsilon)
++            g.calls.append(NATIVE.bind(2, sample, g.indices, g.cu, g.accepted,
++                                       handle.kv_cache[1], DUMMY, tape, g.checkpoint))
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        for kind in ('cuda', 'triton'):
++            def launch():
++                for group in GROUPS:
++                    for handle, call in zip(group.handles, group.calls):
++                        call() if kind == 'cuda' else triton_replay.commit(handle, group)
++            launch()
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                launch()
++            GRAPHS[kind] = graph
++    torch.cuda.current_stream().wait_stream(stream)
++
++
++def commit(**kw):
++    ctx = kw['bufs'].postprocess_align
++    assert ctx is not None
++    active = [g for g in GROUPS if g.last is not None and g.last.num_spec_decodes]
++    if active:
++        assert len(active) == len(GROUPS)
++        kinds = set()
++        for g in GROUPS:
++            gids = [i for i, group in enumerate(kw['kv_cache_config'].kv_cache_groups)
++                    if group.layer_names == g.replay_names]
++            assert len(gids) == 1
++            table = kw['input_batch'].block_table[gids[0]].get_device_tensor(kw['num_reqs'])
++            kinds.add('cuda' if g.last.num_prefills == 0 else 'triton')
++            triton_replay.prepare[(2,)](g.mapping, g.lengths, table, ctx.mamba_state_idx_buf.gpu,
++                ctx.num_scheduled_tokens_buf.gpu, ctx.num_computed_tokens_buf.gpu,
++                ctx.num_draft_tokens_buf.gpu, kw['num_accepted_tokens_gpu'],
++                g.indices, g.cu, g.accepted, g.checkpoint, table.stride(0), g.kv_cache_spec.block_size)
++        assert len(kinds) == 1
++        kind = kinds.pop()
++        GRAPHS[kind].replay()
++
++
++def clear():
++    GROUPS.clear()
++    GRAPHS.clear()
++    for handle in LAYERS.values():
++        handle.replay_calls.clear()
++
++
++def initialize(worker):
++    global NATIVE, DUMMY
++    from vllm.config import CompilationMode
++    from vllm.model_executor.layers.mamba.gdn.replay_native import Native
++
++    config = worker.vllm_config
++    assert worker.parallel_config.tensor_parallel_size == worker.parallel_config.pipeline_parallel_size == 1
++    assert not worker.parallel_config.use_ubatching
++    assert config.scheduler_config.max_num_seqs == 2
++    assert config.compilation_config.mode == CompilationMode.NONE
++    assert worker.cache_config.mamba_cache_mode == 'align'
++    assert worker.cache_config.enable_prefix_caching
++    assert worker.cache_config.kv_cache_memory_bytes is None
++    assert torch.cuda.get_device_capability() == (12, 0)
++    assert len(LAYERS) == len({id(m) for m in LAYERS.values()}) == 48
++    NATIVE = Native()
++    DUMMY = torch.empty((8, 48, 128), device='cuda', dtype=torch.bfloat16)
++    logger.info('GDN state replay enabled: FP32 state, 7.57 MiB tape, no speculative state blocks.')
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/replay_native.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import ctypes
++from pathlib import Path
++
++import torch
++
++
++class Native:
++    def __init__(self):
++        self.lib = ctypes.CDLL(str(Path(__file__).with_name('libgdn_replay.so')))
++        self.launch = self.lib.launch_gdn
++        self.launch.argtypes = ([ctypes.c_int] + [ctypes.c_void_p] * 14 +
++                                [ctypes.c_int] * 3 + [ctypes.c_int64] * 5 +
++                                [ctypes.c_float] * 2 + [ctypes.c_void_p])
++        self.launch.restype = ctypes.c_int
++
++    def bind(self, mode, sample, indices, cu, accepted, state, out, tape, checkpoint):
++        names = ['mixed_qkv', 'a', 'b', 'A_log', 'dt_bias']
++        inputs = [sample[n] for n in names] + [indices, cu, accepted, state,
++                  sample['output_gate'], sample['norm_weight'], out, tape, checkpoint]
++        assert len(inputs) == 14 and all(t.is_cuda for t in inputs)
++        assert all(t.dtype == torch.bfloat16 for t in [sample['mixed_qkv'], sample['a'], sample['b'], sample['output_gate'], out, tape])
++        assert state.dtype == sample['A_log'].dtype == torch.float32
++        assert state.shape[1:] == (48, 128, 128) and state.stride()[1:] == (16384, 128, 1)
++        assert sample['mixed_qkv'].shape[1] == 10240 and sample['A_log'].numel() == 48
++        assert all(t.dtype == torch.int32 and t.is_contiguous() for t in [indices, cu, accepted, checkpoint])
++        batch = indices.shape[0]
++        assert batch in (1, 2) and indices.shape == (batch, 4)
++        assert cu.shape == (batch + 1,) and accepted.shape == checkpoint.shape == (batch,)
++        assert out.is_contiguous() and tape.shape == (batch, 4, 10336) and tape.is_contiguous()
++        assert sample['norm_weight'].shape == (128,)
++        bias_type = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}[sample['dt_bias'].dtype]
++        assert sample['norm_weight'].dtype in (torch.float32, torch.bfloat16)
++        args = [mode] + [t.data_ptr() for t in inputs] + [batch, bias_type, int(sample['norm_weight'].dtype == torch.bfloat16)]
++        args += [sample[n].stride(0) for n in ['mixed_qkv', 'a', 'b', 'output_gate']]
++        args += [state.stride(0), 128 ** -0.5, sample['norm_eps']]
++        device = inputs[0].device
++        def call():
++            stream = torch.cuda.current_stream(device).cuda_stream
++            error = self.launch(*args, stream)
++            if error:
++                raise RuntimeError(f'CUDA replay launch error {error}')
++        return call
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/replay_triton.py
+@@ -0,0 +1,128 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Songlin Yang, Yu Zhang
++# Recurrence from vLLM's fused_sigmoid_gating.py (FLA, MIT, 2023–2025).
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def recurrent(Q, K, V, A, B, AL, DB, S, O, Tape, Indices, Cu, Accepted, Checkpoint,
++              SS: tl.constexpr, QS: tl.constexpr, KS: tl.constexpr, VS: tl.constexpr,
++              AS: tl.constexpr, BS: tl.constexpr, MODE: tl.constexpr):
++    iv, nh = tl.program_id(0), tl.program_id(1)
++    n, hv = nh // 48, nh % 48
++    h = hv // 3
++    bos = tl.load(Cu + n).to(tl.int64)
++    length = tl.load(Cu + n + 1).to(tl.int64) - bos
++    src = tl.load(Indices + n * 4).to(tl.int64)
++    if length <= 0 or src <= 0:
++        return
++    if MODE == 2:
++        accepted = tl.load(Accepted + n)
++        cp = tl.load(Checkpoint + n)
++        if accepted < 1 or accepted > length or (accepted == 1 and cp != 1):
++            return
++    kk = tl.arange(0, 128)
++    vv = iv * 32 + tl.arange(0, 32)
++    offsets = hv * 16384 + vv[:, None] * 128 + kk[None, :]
++    state = tl.load(S + src * SS + offsets).to(tl.float32)
++    if MODE == 2:
++        length = accepted - 1
++        dst = tl.load(Indices + n * 4 + 1).to(tl.int64)
++        if cp == 1 and dst > 0:
++            tl.store(S + dst * SS + offsets, state)
++    for t in range(length):
++        if MODE == 1:
++            q = tl.load(Q + (bos + t) * QS + h * 128 + kk).to(tl.float32)
++            k = tl.load(K + (bos + t) * KS + h * 128 + kk).to(tl.float32)
++            v = tl.load(V + (bos + t) * VS + hv * 128 + vv).to(tl.float32)
++            a = tl.load(A + (bos + t) * AS + hv).to(tl.float32)
++            b = tl.load(B + (bos + t) * BS + hv).to(tl.float32)
++            tape = Tape + (n * 4 + t) * 10336
++            if iv == 0 and hv % 3 == 0:
++                tl.store(tape + h * 128 + kk, q)
++                tl.store(tape + 2048 + h * 128 + kk, k)
++            tl.store(tape + 4096 + hv * 128 + vv, v)
++            if iv == 0:
++                tl.store(tape + 10240 + hv, a)
++                tl.store(tape + 10288 + hv, b)
++        else:
++            tape = Tape + (n * 4 + t + 1) * 10336
++            k = tl.load(tape + 2048 + h * 128 + kk).to(tl.float32)
++            v = tl.load(tape + 4096 + hv * 128 + vv).to(tl.float32)
++            a = tl.load(tape + 10240 + hv).to(tl.float32)
++            b = tl.load(tape + 10288 + hv).to(tl.float32)
++        x = a + tl.load(DB + hv).to(tl.float32)
++        softplus_x = tl.where(x <= 20., tl.log(1 + tl.exp(x)), x)
++        g = -tl.exp(tl.load(AL + hv).to(tl.float32)) * softplus_x
++        beta = tl.sigmoid(b)
++        k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
++        state *= tl.exp(g)
++        v -= tl.sum(state * k[None, :], 1)
++        v *= beta
++        state += v[:, None] * k[None, :]
++        if MODE == 1:
++            q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
++            q = q * (128 ** -0.5)
++            out = tl.sum(state * q[None, :], 1)
++            tl.store(O + (bos + t) * 6144 + hv * 128 + vv, out)
++            if t == 0:
++                tl.store(S + src * SS + offsets, state)
++        else:
++            if cp == t + 2 and dst > 0:
++                tl.store(S + dst * SS + offsets, state)
++    if MODE == 2:
++        tl.store(S + src * SS + offsets, state)
++
++
++def verify(tape, **kw):
++    assert kw['inplace_final_state'] and kw['use_qk_l2norm_in_kernel']
++    q, k, v, a, b = [kw[key] for key in ('q', 'k', 'v', 'a', 'b')]
++    assert q.shape[0] == k.shape[0] == v.shape[0] == 1
++    assert q.shape[2:] == k.shape[2:] == (16, 128) and v.shape[2:] == (48, 128)
++    state, indices, cu = [kw[key] for key in ('initial_state', 'ssm_state_indices', 'cu_seqlens')]
++    n = len(cu) - 1
++    assert n <= 2 and state.dtype == torch.float32
++    out = torch.empty_like(v, memory_format=torch.contiguous_format)
++    recurrent[(4, n * 48)](q, k, v, a, b, kw['A_log'], kw['dt_bias'], state, out,
++        tape, indices, cu, kw['num_accepted_tokens'], kw['num_accepted_tokens'],
++        state.stride(0), q.stride(1), k.stride(1), v.stride(1), a.stride(0), b.stride(0),
++        MODE=1, num_warps=4, num_stages=3)
++    return out, state
++
++
++def commit(module, group):
++    tape, state = module.replay_tape, module.kv_cache[1]
++    recurrent[(4, 96)](tape, tape, tape, tape, tape, module.A_log, module.dt_bias,
++        state, tape, tape, group.indices, group.cu, group.accepted, group.checkpoint,
++        state.stride(0), 0, 0, 0, 0, 0, MODE=2, num_warps=4, num_stages=3)
++
++
++@triton.jit
++def prepare(Map, Lengths, BT, Running, Scheduled, Computed, Draft, Accepted,
++            Indices, Cu, OutAccepted, Checkpoint, STRIDE: tl.constexpr, BLOCK: tl.constexpr):
++    n = tl.program_id(0)
++    r = tl.load(Map + n)
++    length = tl.load(Lengths + n)
++    if n == 0:
++        tl.store(Cu, 0)
++    before = tl.load(Lengths) if n == 1 else 0
++    tl.store(Cu + n + 1, before + length)
++    cols = tl.arange(0, 4)
++    if r < 0 or length <= 0:
++        tl.store(Indices + n * 4 + cols, 0)
++        tl.store(OutAccepted + n, 1)
++        tl.store(Checkpoint + n, 0)
++        return
++    accepted = tl.load(Accepted + r)
++    start = tl.load(Computed + r) + tl.load(Scheduled + r) - tl.load(Draft + r)
++    aligned = ((start + accepted - 1) // BLOCK) * BLOCK
++    checkpoint = tl.where(aligned >= start, aligned - start + 1, 0)
++    src_col = tl.load(Running + r)
++    src = tl.load(BT + r * STRIDE + src_col)
++    dst = tl.load(BT + r * STRIDE + aligned // BLOCK - 1, mask=checkpoint > 0, other=0)
++    tl.store(Indices + n * 4 + cols, tl.where(cols == 0, src, tl.where(cols == 1, dst, 0)))
++    tl.store(OutAccepted + n, accepted)
++    tl.store(Checkpoint + n, checkpoint)
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -6,6 +6,8 @@
+ from typing import Literal
+ 
+ import torch
++
++from vllm.model_executor.layers.mamba.gdn import replay
+ 
+ from vllm.config import VllmConfig
+ from vllm.utils.torch_utils import async_tensor_h2d
+@@ -164,6 +166,7 @@
+             dtype=torch.int32,
+             device=device,
+         )
++        replay.init_metadata(self, kv_cache_spec, layer_names, device)
+ 
+     def _build_chunk_metadata(
+         self,
+@@ -226,6 +229,8 @@
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )
++        assert block_table_tensor.shape[1] == 1
++        block_table_tensor = block_table_tensor.expand(-1, 4)
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+@@ -520,7 +525,7 @@
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
+-        return attn_metadata
++        return replay.update_metadata(self, attn_metadata, num_decode_draft_tokens_cpu, m)
+ 
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -21,6 +21,7 @@
+ from tqdm import tqdm
+ 
+ import vllm.envs as envs
++from vllm.model_executor.layers.mamba.gdn import replay
+ from vllm.compilation.breakable_cudagraph import (
+     BreakableCUDAGraphWrapper,
+     is_breakable_cudagraph_enabled,
+@@ -6702,6 +6703,7 @@
+             torch.accelerator.synchronize()
+ 
+     def _cleanup_profiling_kv_cache(self) -> None:
++        replay.clear()
+         torch.accelerator.synchronize()
+         if hasattr(self, "kv_caches") and self.kv_caches:
+             for i in range(len(self.kv_caches)):
+@@ -7260,6 +7262,7 @@
+         """
+         Create the metadata builders for all KV cache groups and attn groups.
+         """
++        replay.clear()
+         for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
+             for attn_group in self.attn_groups[kv_cache_group_id]:
+                 attn_group.create_metadata_builders(
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -17,6 +17,7 @@
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
++from vllm.model_executor.layers.mamba.gdn import replay
+ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+ from vllm.config.compilation import CompilationMode
+ from vllm.device_allocator import get_mem_allocator_instance
+@@ -484,6 +485,7 @@
+             You may limit the usage of GPU memory
+             by adjusting the `gpu_memory_utilization` parameter.
+         """
++        replay.initialize(self)
+         maybe_apply_startup_plan(self)
+ 
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+@@ -692,6 +694,7 @@
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
++        replay.commit_graphs()
+         warmup_sizes: list[int] = []
+ 
+         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -6,6 +6,8 @@
+ from typing import Any, NamedTuple
+ 
+ import torch
++
++from vllm.model_executor.layers.mamba.gdn import replay
+ 
+ from vllm.config import CacheConfig
+ from vllm.logger import init_logger
+@@ -281,7 +283,7 @@
+     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
+     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
+     # SMs filled at small batch.
+-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
++    actual_src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+     src_addr = state_base_addr + actual_src_block_id * state_block_stride
+     # Use natural block data size (inner_size * elem_size), NOT
+     # state_block_stride which is the page stride and can exceed the
+@@ -408,6 +410,9 @@
+ 
+     # Skip no-op self-copy.
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
++        return
++
++    if tl.load(state_conv_widths_ptr + state_idx) == 0:
+         return
+ 
+     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+@@ -1249,6 +1254,7 @@
+     Copy the mamba state of previous step to the last
+     (1 + num_speculative_blocks) block.
+     """
++    assert align_ctx is not None, "GDN replay requires fused precopy"
+     fused = _resolve_fused_precopy(align_ctx)
+     mamba_group_ids = copy_bufs.mamba_group_ids
+     mamba_spec = copy_bufs.mamba_spec
+@@ -1403,6 +1409,9 @@
+     and async-copies the per-request accepted-token counts back to the input
+     batch's CPU tensor for the next iteration's preprocess.
+     """
++    replay.commit(bufs=bufs, num_reqs=num_reqs,
++                  num_accepted_tokens_gpu=num_accepted_tokens_gpu,
++                  input_batch=input_batch, kv_cache_config=kv_cache_config)
+     ctx = bufs.postprocess_align
+     # Caller is responsible for gating on spec decode + hybrid; this assert is
+     # a tripwire if those gates ever drift apart.

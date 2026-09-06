@@ -1,0 +1,60 @@
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -128,6 +128,7 @@
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
++    VLLM_GDN_DIRECT_SCAN_OUTPUT: bool = False
+     VLLM_USE_HOST_MAPPED_EMBEDDINGS: bool = False
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+     VLLM_DISABLE_PYNCCL: bool = False
+@@ -1208,6 +1209,11 @@
+     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
+         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+     ),
++    # Let the GDN prefill scan write directly into the model runner's
++    # preallocated output buffer, avoiding a temporary output and copy.
++    "VLLM_GDN_DIRECT_SCAN_OUTPUT": lambda: bool(
++        int(os.getenv("VLLM_GDN_DIRECT_SCAN_OUTPUT", "0"))
++    ),
+     # Keep compressed input-embedding weights in pinned system RAM and expose
+     # them to CUDA kernels through a UVA view. This is opt-in because it trades
+     # a small amount of PCIe bandwidth for GPU memory.
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1385,6 +1385,14 @@
+             and attn_metadata.num_prefills > 0
+             and attn_metadata.num_decodes > 0
+         )
++        direct_scan_output = (
++            envs.VLLM_GDN_DIRECT_SCAN_OUTPUT
++            and spec_sequence_masks is None
++            and attn_metadata.num_prefills > 0
++            and not split_non_spec
++        )
++        if direct_scan_output:
++            logger.info_once("GDN direct-scan-output enabled: bridge copy elided")
+         num_decode_tokens = attn_metadata.num_decode_tokens
+ 
+         if attn_metadata.num_prefills > 0:
+@@ -1515,6 +1523,11 @@
+                 chunk_indices=attn_metadata.chunk_indices,
+                 chunk_offsets=attn_metadata.chunk_offsets,
+                 use_qk_l2norm_in_kernel=False,
++                core_attn_out=(
++                    core_attn_out[:num_actual_tokens]
++                    if direct_scan_output
++                    else None
++                ),
+             )
+             # Init cache
+             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+@@ -1560,7 +1573,7 @@
+             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+         elif spec_sequence_masks is not None:
+             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+-        else:
++        elif not direct_scan_output:
+             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+ 
+     def _forward_core_decode_aiter(

@@ -1,0 +1,342 @@
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -25,6 +25,7 @@
+ """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
+ 
+ from collections.abc import Iterable
++import functools
+ 
+ import torch
+ from torch import nn
+@@ -33,6 +34,8 @@
+ from vllm.config import VllmConfig
+ from vllm.distributed import (
+     get_pp_group,
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.utils import (
+@@ -55,6 +58,7 @@
+ )
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.sequence import IntermediateTensors
++from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+ from vllm.transformers_utils.configs.qwen3_5_moe import (
+@@ -103,6 +107,267 @@
+ logger = init_logger(__name__)
+ 
+ 
++# Fixed seed-0 H256 basis from the validated coding-context KV replay. Keeping
++# the source here makes the existing qwen3_5.py bind mount self-contained.
++_QWEN35_INT8_PTH_HADAMARD_CUDA = r"""#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++
++template <typename T> __device__ float to_float(T x) { return float(x); }
++template <> __device__ float to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
++template <typename T> __device__ T from_float(float x) { return T(x); }
++template <> __device__ __nv_bfloat16 from_float(float x) { return __float2bfloat16_rn(x); }
++
++// Each warp transforms one 256-element row. The sign vector is fixed per KV
++// head; grouped Q/output heads map to that KV head through head_group.
++template <typename In, typename Out, bool inverse>
++__global__ void hadamard256(In const* input, Out* output, int8_t const* signs,
++                           uint64_t rows, uint32_t heads, uint32_t head_group) {
++  uint32_t const lane = threadIdx.x & 31u;
++  uint64_t const row = (uint64_t(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
++  if (row >= rows) return;  // Entire warp is inactive together.
++  uint32_t const kv_head = uint32_t(row % heads) / head_group;
++  float x[8];
++#pragma unroll
++  for (uint32_t j = 0; j < 8; ++j) {
++    uint32_t const dim = lane + 32 * j;
++    x[j] = to_float(input[row * 256 + dim]);
++    if constexpr (!inverse) x[j] *= float(signs[kv_head * 256 + dim]);
++  }
++#pragma unroll
++  for (uint32_t mask = 1; mask < 32; mask <<= 1) {
++#pragma unroll
++    for (uint32_t j = 0; j < 8; ++j) {
++      float const other = __shfl_xor_sync(0xffffffffu, x[j], mask);
++      x[j] = (lane & mask) ? other - x[j] : x[j] + other;
++    }
++  }
++#pragma unroll
++  for (uint32_t mask = 1; mask < 8; mask <<= 1) {
++#pragma unroll
++    for (uint32_t j = 0; j < 8; ++j) {
++      if ((j & mask) == 0) {
++        float const a = x[j], b = x[j + mask];
++        x[j] = a + b;
++        x[j + mask] = a - b;
++      }
++    }
++  }
++#pragma unroll
++  for (uint32_t j = 0; j < 8; ++j) {
++    uint32_t const dim = lane + 32 * j;
++    float y = x[j] * 0.0625f;
++    if constexpr (inverse) y *= float(signs[kv_head * 256 + dim]);
++    output[row * 256 + dim] = from_float<Out>(y);
++  }
++}
++
++template <typename In, typename Out>
++void launch(void const* input, void* output, int8_t const* signs,
++            uint64_t rows, uint32_t heads, uint32_t group, bool inverse,
++            cudaStream_t stream) {
++  unsigned const blocks = unsigned((rows + 3) / 4);
++  if (inverse)
++    hadamard256<In, Out, true><<<blocks, 128, 0, stream>>>(
++        static_cast<In const*>(input), static_cast<Out*>(output), signs, rows, heads, group);
++  else
++    hadamard256<In, Out, false><<<blocks, 128, 0, stream>>>(
++        static_cast<In const*>(input), static_cast<Out*>(output), signs, rows, heads, group);
++}
++
++extern "C" int launch_hadamard(void const* input, void* output, int8_t const* signs,
++                               uint64_t rows, uint32_t heads, uint32_t group,
++                               int input_fp32, int output_fp32, int inverse,
++                               void* stream_ptr) {
++  if (!input || !output || !signs || input == output || !rows || !heads ||
++      !group || heads % group || (rows + 3) / 4 > 2147483647ULL)
++    return int(cudaErrorInvalidValue);
++  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++  if (input_fp32) {
++    if (output_fp32) launch<float, float>(input, output, signs, rows, heads, group, inverse, stream);
++    else launch<float, __nv_bfloat16>(input, output, signs, rows, heads, group, inverse, stream);
++  } else {
++    if (output_fp32) launch<__nv_bfloat16, float>(input, output, signs, rows, heads, group, inverse, stream);
++    else launch<__nv_bfloat16, __nv_bfloat16>(input, output, signs, rows, heads, group, inverse, stream);
++  }
++  return int(cudaGetLastError());
++}
++"""
++
++
++@functools.lru_cache(maxsize=1)
++def _qwen35_pth_hadamard_kernel():
++    """Build once before model compilation; reuse a locked, versioned cache."""
++    import ctypes
++    import fcntl
++    import hashlib
++    import json
++    from pathlib import Path
++    import shutil
++    import subprocess
++    import tempfile
++
++    from vllm import envs as vllm_envs
++
++    nvcc = shutil.which("nvcc")
++    if nvcc is None:
++        nvcc = str(Path(vllm_envs.CUDA_HOME or "/usr/local/cuda") / "bin/nvcc")
++    version = subprocess.check_output([nvcc, "--version"], text=True)
++    flags = ["-std=c++17", "-O3", "-Xcompiler=-fPIC",
++             "-gencode=arch=compute_120,code=sm_120", "-Xptxas=-v"]
++    identity = json.dumps({"source": _QWEN35_INT8_PTH_HADAMARD_CUDA,
++                           "nvcc": version, "flags": flags}, sort_keys=True)
++    digest = hashlib.sha256(identity.encode()).hexdigest()
++    directory = Path(vllm_envs.VLLM_CACHE_ROOT) / "qwen35_int8_pth_hadamard" / digest
++    directory.mkdir(parents=True, exist_ok=True)
++    library_path = directory / "hadamard.so"
++    with (directory / "build.lock").open("a") as lock:
++        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
++        if not library_path.is_file():
++            source = directory / "hadamard.cu"
++            source.write_text(_QWEN35_INT8_PTH_HADAMARD_CUDA)
++            # Rename a completed library into place; interrupted compilation
++            # must not leave a library that another worker will try to load.
++            with tempfile.TemporaryDirectory(prefix="build-", dir=directory) as temp:
++                obj = Path(temp) / "hadamard.cuda.o"
++                library = Path(temp) / "hadamard.so"
++                commands = [[nvcc, *flags, "-c", str(source), "-o", str(obj)],
++                            [nvcc, "--shared", "-Xcompiler=-fPIC", str(obj), "-o", str(library)]]
++                for index, command in enumerate(commands):
++                    result = subprocess.run(command, capture_output=True, text=True)
++                    (directory / f"build-{index}.log").write_text(result.stdout + result.stderr)
++                    if result.returncode:
++                        raise RuntimeError(
++                            "Qwen INT8-PTH Hadamard compilation failed; "
++                            f"see {directory / f'build-{index}.log'}\n{result.stderr}"
++                        )
++                obj.replace(directory / "hadamard.cuda.o")
++                library.replace(library_path)
++    library = ctypes.CDLL(str(library_path))
++    launch = library.launch_hadamard
++    launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
++                       ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32,
++                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
++    launch.restype = ctypes.c_int
++    return library, launch
++
++
++def _qwen35_pth_hadamard(
++    source: torch.Tensor, signs: torch.Tensor, inverse: bool,
++) -> torch.Tensor:
++    if (source.ndim != 3 or source.shape[-1] != 256 or not source.is_cuda
++            or source.dtype not in (torch.bfloat16, torch.float32)):
++        raise ValueError("Qwen INT8-PTH Hadamard requires CUDA BF16/FP32 [tokens, heads, 256]")
++    if (signs.ndim != 2 or signs.shape[-1] != 256 or signs.shape[0] == 0
++            or signs.device != source.device or signs.dtype != torch.int8
++            or not signs.is_contiguous() or source.shape[1] % signs.shape[0]):
++        raise ValueError("Invalid Qwen INT8-PTH Hadamard head/sign mapping")
++    # The V projection is a strided slice of packed QKV. Pack it inside this
++    # opaque op; never bind a stale prepacked copy while capturing CUDA graphs.
++    packed = source.contiguous()
++    output = torch.empty_like(
++        packed, dtype=torch.bfloat16 if inverse else packed.dtype,
++        memory_format=torch.contiguous_format,
++    )
++    if packed.numel() == 0:
++        return output
++    _, launch = _qwen35_pth_hadamard_kernel()
++    with torch.cuda.device(source.device):
++        stream = torch.cuda.current_stream(source.device).cuda_stream
++        status = launch(packed.data_ptr(), output.data_ptr(), signs.data_ptr(),
++                        packed.numel() // 256, packed.shape[1],
++                        packed.shape[1] // signs.shape[0],
++                        int(packed.dtype == torch.float32),
++                        int(output.dtype == torch.float32), int(inverse), stream)
++    if status:
++        raise RuntimeError(f"Qwen INT8-PTH Hadamard CUDA launch failed: {status}")
++    return output
++
++
++def _qwen35_pth_hadamard_fake(
++    source: torch.Tensor, signs: torch.Tensor, inverse: bool,
++) -> torch.Tensor:
++    return torch.empty_like(
++        source, dtype=torch.bfloat16 if inverse else source.dtype,
++        memory_format=torch.contiguous_format,
++    )
++
++
++direct_register_custom_op(
++    op_name="qwen35_int8_pth_hadamard",
++    op_func=_qwen35_pth_hadamard,
++    mutates_args=[],
++    fake_impl=_qwen35_pth_hadamard_fake,
++)
++
++
++def _qwen35_pth_signs(layer_idx, total_kv_heads, tp_size, tp_rank):
++    """Global head signs remain identical under partitioning or replication."""
++    import numpy as np
++
++    if total_kv_heads >= tp_size:
++        assert total_kv_heads % tp_size == 0
++        local_heads = total_kv_heads // tp_size
++        start = tp_rank * local_heads
++    else:
++        assert tp_size % total_kv_heads == 0
++        local_heads = 1
++        start = tp_rank // (tp_size // total_kv_heads)
++    signs = []
++    for kind in (0, 1):
++        rng = np.random.default_rng(np.random.SeedSequence([0, layer_idx, kind]))
++        full = (rng.integers(0, 2, size=(total_kv_heads, 256)) * 2 - 1).astype(np.int8)
++        signs.append(full[start:start + local_heads].copy())
++    return signs
++
++
++class Qwen3_5Int8PTHAttention(Qwen3NextAttention):
++    """Rotate after RoPE and invert before the elementwise output gate."""
++
++    def __init__(
++        self, config, model_config=None, cache_config=None, quant_config=None,
++        reduce_results=True, prefix="",
++    ):
++        super().__init__(config, model_config=model_config, cache_config=cache_config,
++                         quant_config=quant_config, reduce_results=reduce_results,
++                         prefix=prefix)
++        device = self.q_norm.weight.device
++        if (self.head_dim != 256 or device.type != "cuda"
++                or torch.cuda.get_device_capability(device) != (12, 0)):
++            raise ValueError("Qwen INT8-PTH Hadamard is validated for head_dim=256 on SM120")
++        # Build outside torch.compile and CUDA graph capture. The handle stays
++        # alive through the cached helper, across all target and MTP layers.
++        _qwen35_pth_hadamard_kernel()
++        k_signs, v_signs = _qwen35_pth_signs(
++            extract_layer_index(prefix), self.total_num_kv_heads,
++            get_tensor_model_parallel_world_size(), get_tensor_model_parallel_rank(),
++        )
++        self.register_buffer("_pth_k_signs", torch.tensor(k_signs, dtype=torch.int8, device=device), persistent=False)
++        self.register_buffer("_pth_v_signs", torch.tensor(v_signs, dtype=torch.int8, device=device), persistent=False)
++
++    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
++        qkv, _ = self.qkv_proj(hidden_states)
++        q, k, v, gate = self._project_qkv_gate(qkv, positions)
++        q = torch.ops.vllm.qwen35_int8_pth_hadamard(
++            q.view(-1, self.num_heads, self.head_dim), self._pth_k_signs, False,
++        ).view(-1, self.q_size)
++        k = torch.ops.vllm.qwen35_int8_pth_hadamard(
++            k.view(-1, self.num_kv_heads, self.head_dim), self._pth_k_signs, False,
++        ).view(-1, self.kv_size)
++        v = torch.ops.vllm.qwen35_int8_pth_hadamard(
++            v.view(-1, self.num_kv_heads, self.head_dim), self._pth_v_signs, False,
++        ).view(-1, self.kv_size)
++        # Attention receives rotated Q/K/V, including its normal cache update.
++        attn_output = self.attn(q, k, v, output_dtype=torch.float32)
++        attn_output = torch.ops.vllm.qwen35_int8_pth_hadamard(
++            attn_output.view(-1, self.num_heads, self.head_dim), self._pth_v_signs, True,
++        ).view(-1, self.q_size)
++        if gate is not None:
++            attn_output = attn_output * torch.sigmoid(gate)
++        output, _ = self.o_proj(attn_output)
++        return output
++
++
+ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
+     def get_hf_config(self):
+         return self.ctx.get_hf_config(Qwen3_5Config)
+@@ -150,7 +415,13 @@
+                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
+             )
+         elif self.layer_type == "full_attention":
+-            self.self_attn = Qwen3NextAttention(
++            attention_cls = (
++                Qwen3_5Int8PTHAttention
++                if cache_config is not None
++                and cache_config.cache_dtype == "int8_per_token_head"
++                else Qwen3NextAttention
++            )
++            self.self_attn = attention_cls(
+                 config,
+                 model_config=model_config,
+                 cache_config=cache_config,
+@@ -274,6 +545,17 @@
+             self.norm = PPMissingLayer()
+ 
+         self.aux_hidden_state_layers: tuple[int, ...] = ()
++
++    def forward(
++        self,
++        input_ids: torch.Tensor | None,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
++        # Give this model its own AOT identity. An inherited qwen3_next.forward
++        # could otherwise load a pre-Hadamard graph without tracing this file.
++        return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -1,6 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Inference-only Qwen3_5 MTP model."""
++"""Inference-only Qwen3_5 MTP model.
++
++The shared decoder applies seed-0 Hadamard rotation to INT8-PTH attention.
++This source revision also invalidates pre-rotation MTP AOT graphs.
++"""
+ 
+ from collections.abc import Iterable
+ 

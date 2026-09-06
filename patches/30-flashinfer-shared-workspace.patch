@@ -1,0 +1,411 @@
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -6,6 +6,7 @@
+ from enum import Enum
+ from functools import partial
+ from typing import ClassVar
++from weakref import WeakSet
+ 
+ import numpy as np
+ import torch
+@@ -90,22 +91,89 @@
+ 
+ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+ FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
++# XQA owns the first 8 MiB of its workspace as persistent semaphore storage.
++# Native prefill may share the remaining scratch region, but must not touch it.
++FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE = 8 * 1024 * 1024
++# FlashInfer 0.6.17 generic XQA constants used to bound its caller-owned
++# scratch. Keep apply.sh's FlashInfer version guard in sync with these values.
++FLASHINFER_XQA_CTA_TILE_SEQ_LEN = 256
++FLASHINFER_XQA_ROWS_PER_SPEC_BLOCK = 32
++FLASHINFER_XQA_ROW_STATS_BYTES_PER_WARP_TILE = 128
++FLASHINFER_XQA_INPUT_ELEM_SIZE = 2
+ 
+ FP8_DTYPE = current_platform.fp8_dtype()
+ FP4_DTYPE = torch.uint8
+ 
+ logger = init_logger(__name__)
+ 
+-trtllm_workspace_buffer = None
++_flashinfer_shared_workspace_buffers: dict[torch.device, torch.Tensor] = {}
++_flashinfer_shared_workspace_consumers: dict[torch.device, WeakSet] = {}
++
++
++def _canonical_cuda_device(device: torch.device | str) -> torch.device:
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
++    return device
++
++
++def _register_shared_workspace_consumer(device: torch.device, consumer) -> None:
++    device = _canonical_cuda_device(device)
++    consumers = _flashinfer_shared_workspace_consumers.setdefault(device, WeakSet())
++    consumers.add(consumer)
++
++
++def _get_shared_workspace_buffer(
++    device: torch.device | str,
++    native_workspace_size: int = 0,
++    xqa_min_workspace_size: int = 0,
++) -> torch.Tensor:
++    """Return one arena shared by native prefill and XQA/TRTLLM decode.
++
++    Attention execution is stream ordered: native prefill finishes using the
++    scratch region before decode starts using it. The XQA semaphore prefix is
++    kept private because XQA requires it to remain zero-initialized/persistent.
++    """
++    device = _canonical_cuda_device(device)
++    xqa_workspace_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
++    if xqa_workspace_size < xqa_min_workspace_size:
++        raise ValueError(
++            "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE is too small for the "
++            "configured FlashInfer 0.6.17 XQA shape envelope: "
++            f"configured {xqa_workspace_size / (1 << 20):.2f} MiB, "
++            f"minimum {xqa_min_workspace_size / (1 << 20):.2f} MiB"
++        )
++    required_size = max(
++        xqa_workspace_size,
++        FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE + native_workspace_size,
++    )
++    workspace_buffer = _flashinfer_shared_workspace_buffers.get(device)
++    if workspace_buffer is None or workspace_buffer.numel() < required_size:
++        old_size = workspace_buffer.numel() if workspace_buffer is not None else 0
++        workspace_buffer = torch.zeros(
++            required_size, dtype=torch.uint8, device=device
++        )
++        _flashinfer_shared_workspace_buffers[device] = workspace_buffer
++        for consumer in list(
++            _flashinfer_shared_workspace_consumers.get(device, ())
++        ):
++            consumer._reset_shared_workspace_buffer(workspace_buffer)
++        logger.info(
++            "FlashInfer shared attention workspace on %s: %.2f MiB "
++            "(was %.2f MiB, XQA configured %.2f MiB, "
++            "XQA minimum %.2f MiB, native prefill %.2f MiB)",
++            device,
++            required_size / (1 << 20),
++            old_size / (1 << 20),
++            xqa_workspace_size / (1 << 20),
++            xqa_min_workspace_size / (1 << 20),
++            native_workspace_size / (1 << 20),
++        )
++    return workspace_buffer
+ 
+ 
+ def _get_trtllm_workspace_buffer():
+-    global trtllm_workspace_buffer
+-    if trtllm_workspace_buffer is None:
+-        trtllm_workspace_buffer = torch.zeros(
+-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
+-        )
+-    return trtllm_workspace_buffer
++    return _get_shared_workspace_buffer("cuda")
+ 
+ 
+ def _pack_draft_block_bool_mask(
+@@ -709,6 +777,7 @@
+         self.model_config = vllm_config.model_config
+         self.attention_config = vllm_config.attention_config
+         self._workspace_buffer = None
++        self._native_workspace_size = 0
+         self._prefill_wrapper: (
+             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+         ) = None  # Wrapper for prefill/append
+@@ -870,6 +939,9 @@
+             # flash_attn_varlen_func's cp_world_size/cp_rank/cp_tot_seqused_k).
+             supports_dcp_with_varlen=False,
+         )
++        self._xqa_min_workspace_size = 0
++        if self.use_dedicated_xqa:
++            self._xqa_min_workspace_size = self._get_xqa_min_workspace_size()
+ 
+         self._cascade_wrapper = None  # Wrapper for cascade attention
+ 
+@@ -926,6 +998,12 @@
+         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
+         self.paged_kv_indices = self._make_buffer(max_num_pages)
+         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
++
++        # Size and allocate the shared arena before XQA CUDA graphs capture its
++        # address. This also lets the allocation survive profiling and become
++        # visible to vLLM before the real KV cache is initialized.
++        if self.use_dedicated_xqa:
++            self._presize_xqa_shared_workspace()
+ 
+     # Keep SM90 prefill/decode Q dtype selection in one place.
+     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
+@@ -1026,30 +1104,252 @@
+         else:
+             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+ 
++    def _get_xqa_min_workspace_size(self) -> int:
++        """Bound the generic XQA workspace layout shipped by FlashInfer 0.6.17."""
++        head_group_ratio = self.num_qo_heads // self.num_kv_heads
++        max_q_len = max(1, self.reorder_batch_threshold or 1)
++        max_seq_len = cdiv(
++            self.model_config.max_model_len, self.page_size
++        ) * self.page_size
++        sm_count = torch.cuda.get_device_properties(
++            _canonical_cuda_device(self.device)
++        ).multi_processor_count
++        max_scratch_size = 0
++
++        for batch_size in range(1, self.max_num_reqs + 1):
++            subseqs_per_group = min(
++                max(1, sm_count // (batch_size * self.num_kv_heads)),
++                cdiv(max_seq_len, FLASHINFER_XQA_CTA_TILE_SEQ_LEN),
++            )
++            for q_len in range(1, max_q_len + 1):
++                if q_len == 1:
++                    valid_rows = head_group_ratio
++                    token_blocks_per_group = 1
++                else:
++                    valid_rows = FLASHINFER_XQA_ROWS_PER_SPEC_BLOCK
++                    token_blocks_per_group = cdiv(
++                        q_len * head_group_ratio,
++                        FLASHINFER_XQA_ROWS_PER_SPEC_BLOCK,
++                    )
++
++                warp_tile_rows = cdiv(valid_rows, 16) * 16
++                row_stats_size = (
++                    cdiv(warp_tile_rows, 32)
++                    * FLASHINFER_XQA_ROW_STATS_BYTES_PER_WARP_TILE
++                )
++                partial_output_size = (
++                    valid_rows
++                    * self.head_dim
++                    * FLASHINFER_XQA_INPUT_ELEM_SIZE
++                )
++                num_subseqs = (
++                    subseqs_per_group
++                    * batch_size
++                    * self.num_kv_heads
++                    * token_blocks_per_group
++                )
++
++                row_stats_end = 2 * row_stats_size * num_subseqs
++                partials_begin = (
++                    cdiv(row_stats_end, partial_output_size)
++                    * partial_output_size
++                )
++                scratch_size = (
++                    partials_begin + partial_output_size * num_subseqs
++                )
++                max_scratch_size = max(max_scratch_size, scratch_size)
++
++        required_size = FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE + max_scratch_size
++        return cdiv(required_size, 1 << 20) * (1 << 20)
++
+     def _get_workspace_buffer(self):
+         if self._workspace_buffer is None:
+-            buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+-            if envs.VLLM_BATCH_INVARIANT:
+-                buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
++            if self.use_dedicated_xqa:
++                _register_shared_workspace_consumer(self.device, self)
++                workspace_buffer = _get_shared_workspace_buffer(
++                    self.device,
++                    self._native_workspace_size,
++                    self._xqa_min_workspace_size,
++                )
++                self._workspace_buffer = workspace_buffer[
++                    FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE:
++                ]
+             else:
+-                # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
+-                # scale with the prefill chunk and query-head footprint, NOT
+-                # context length. The fixed ~394 MiB default is too small for
+-                # wide-head models at the default 8192-token chunk on some
+-                # archs (e.g. sm_120), where FlashInfer hard-errors instead of
+-                # growing. Size to the batch's head footprint; never shrink
+-                # below the configured default.
+-                est = (
+-                    self.max_num_batched_tokens
+-                    * self.num_qo_heads
+-                    * self.head_dim
+-                    * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
+-                )
+-                buffer_size = max(buffer_size, est)
+-            self._workspace_buffer = torch.zeros(
+-                buffer_size, dtype=torch.uint8, device=self.device
+-            )
++                buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
++                if envs.VLLM_BATCH_INVARIANT:
++                    buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
++                else:
++                    # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
++                    # scale with the prefill chunk and query-head footprint, NOT
++                    # context length. Size conservatively on paths where exact
++                    # workspace sizing is not available.
++                    est = (
++                        self.max_num_batched_tokens
++                        * self.num_qo_heads
++                        * self.head_dim
++                        * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
++                    )
++                    buffer_size = max(buffer_size, est)
++                self._workspace_buffer = torch.zeros(
++                    buffer_size, dtype=torch.uint8, device=self.device
++                )
+         return self._workspace_buffer
++
++    def _reset_shared_workspace_buffer(
++        self, workspace_buffer: torch.Tensor
++    ) -> None:
++        """Repoint this builder if another attention group grows the arena."""
++        native_workspace_buffer = workspace_buffer[
++            FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE:
++        ]
++        self._workspace_buffer = native_workspace_buffer
++        wrapper = self._prefill_wrapper
++        if wrapper is not None:
++            assert isinstance(wrapper, BatchPrefillWithPagedKVCacheWrapper)
++            wrapper.reset_workspace_buffer(
++                native_workspace_buffer, wrapper._int_workspace_buffer
++            )
++
++    def _presize_xqa_shared_workspace(self) -> None:
++        """Sample the native-prefill shape envelope, then share with XQA."""
++        assert not self.use_dcp
++        assert not self.has_sinks
++        wrapper = self._get_prefill_wrapper(causal=True)
++        assert isinstance(wrapper, BatchPrefillWithPagedKVCacheWrapper)
++
++        max_tokens = self.max_num_batched_tokens
++        min_prefill_len = min(
++            max_tokens, max(1, (self.reorder_batch_threshold or 0) + 1)
++        )
++        max_reqs = max(
++            1, min(self.max_num_reqs, max_tokens // min_prefill_len)
++        )
++        candidate_lens = {min_prefill_len, max_tokens}
++        power_of_two = 1
++        while power_of_two <= max_tokens:
++            for query_len in (
++                power_of_two - 1,
++                power_of_two,
++                power_of_two + 1,
++            ):
++                if min_prefill_len <= query_len <= max_tokens:
++                    candidate_lens.add(query_len)
++            power_of_two *= 2
++
++        query_patterns: set[tuple[int, ...]] = set()
++        for query_len in candidate_lens:
++            query_patterns.add((query_len,))
++            for num_reqs in range(2, max_reqs + 1):
++                if query_len * num_reqs <= max_tokens:
++                    query_patterns.add((query_len,) * num_reqs)
++                if query_len + min_prefill_len * (num_reqs - 1) <= max_tokens:
++                    query_patterns.add(
++                        (query_len,) + (min_prefill_len,) * (num_reqs - 1)
++                    )
++
++        balanced = [max_tokens // max_reqs] * max_reqs
++        balanced[-1] += max_tokens % max_reqs
++        skewed = [
++            max_tokens - min_prefill_len * (max_reqs - 1),
++            *([min_prefill_len] * (max_reqs - 1)),
++        ]
++        query_patterns.update(((max_tokens,), tuple(balanced), tuple(skewed)))
++
++        max_float_workspace_size = 0
++        max_int_workspace_size = 0
++        max_seq_len = self.model_config.max_model_len
++        pages_per_req = cdiv(max_seq_len, self.page_size)
++        last_page_len = max_seq_len % self.page_size or self.page_size
++        o_dtype = FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
++
++        try:
++            for query_lens in sorted(
++                query_patterns,
++                key=lambda pattern: (len(pattern), sum(pattern), pattern),
++            ):
++                num_reqs = len(query_lens)
++                qo_indptr = torch.tensor(
++                    [0, *np.cumsum(query_lens)], dtype=torch.int32, device="cpu"
++                )
++                paged_kv_indptr = torch.arange(
++                    0,
++                    (num_reqs + 1) * pages_per_req,
++                    pages_per_req,
++                    dtype=torch.int32,
++                    device="cpu",
++                )
++                paged_kv_indices = torch.zeros(
++                    num_reqs * pages_per_req, dtype=torch.int32, device="cpu"
++                )
++                paged_kv_last_page_len = torch.full(
++                    (num_reqs,),
++                    last_page_len,
++                    dtype=torch.int32,
++                    device="cpu",
++                )
++                float_size, int_size = wrapper.workspace_size(
++                    qo_indptr=qo_indptr,
++                    paged_kv_indptr=paged_kv_indptr,
++                    paged_kv_indices=paged_kv_indices,
++                    paged_kv_last_page_len=paged_kv_last_page_len,
++                    num_qo_heads=self.num_qo_heads,
++                    num_kv_heads=self.num_kv_heads,
++                    head_dim_qk=self.head_dim,
++                    page_size=self.page_size,
++                    causal=True,
++                    sm_scale=self.sm_scale,
++                    window_left=self.window_left,
++                    logits_soft_cap=self.logits_soft_cap,
++                    q_data_type=self.q_data_type_prefill,
++                    kv_data_type=self.kv_cache_dtype,
++                    o_data_type=o_dtype,
++                    fixed_split_size=self.prefill_fixed_split_size,
++                    disable_split_kv=self.disable_split_kv,
++                )
++                max_float_workspace_size = max(max_float_workspace_size, float_size)
++                max_int_workspace_size = max(max_int_workspace_size, int_size)
++        except (AttributeError, NotImplementedError) as exc:
++            max_float_workspace_size = max(
++                envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
++                self.max_num_batched_tokens
++                * self.num_qo_heads
++                * self.head_dim
++                * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM,
++            )
++            logger.warning_once(
++                "FlashInfer exact prefill workspace sizing is unavailable (%s); "
++                "using the conservative %.2f MiB estimate.",
++                exc,
++                max_float_workspace_size / (1 << 20),
++            )
++
++        self._native_workspace_size = max_float_workspace_size
++        workspace_buffer = _get_shared_workspace_buffer(
++            self.device,
++            max_float_workspace_size,
++            self._xqa_min_workspace_size,
++        )
++        self._reset_shared_workspace_buffer(workspace_buffer)
++
++        int_workspace_buffer = wrapper._int_workspace_buffer
++        int_workspace_size = (
++            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
++        )
++        if int_workspace_size < max_int_workspace_size:
++            int_workspace_buffer = torch.empty(
++                max_int_workspace_size, dtype=torch.uint8, device=self.device
++            )
++            wrapper.reset_workspace_buffer(
++                self._workspace_buffer, int_workspace_buffer
++            )
++
++        logger.info(
++            "FlashInfer native-prefill workspace across %d sampled configured "
++            "shapes: %.2f MiB float, %.2f MiB int",
++            len(query_patterns),
++            max_float_workspace_size / (1 << 20),
++            max_int_workspace_size / (1 << 20),
++        )
+ 
+     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
+         self._workspace_buffer = workspace_buffer

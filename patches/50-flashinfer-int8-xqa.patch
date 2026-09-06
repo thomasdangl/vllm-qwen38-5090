@@ -1,0 +1,1565 @@
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -2,10 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Attention layer with FlashInfer."""
+ 
++import os
+ from dataclasses import dataclass, replace
+ from enum import Enum
+ from functools import partial
+-from typing import ClassVar
++from typing import Any, ClassVar
+ from weakref import WeakSet
+ 
+ import numpy as np
+@@ -220,6 +221,64 @@
+     return _pack_draft_block_bool_mask(bool_mask, num_packed)
+ 
+ 
++def _int8_pth_xqa_required_workspace_size(
++    *,
++    batch_size: int,
++    num_kv_heads: int,
++    head_group_ratio: int,
++    head_dim: int,
++    q_len: int,
++    max_seq_len: int,
++    sm_count: int,
++) -> int:
++    """Exact caller-owned workspace bound for the patched PTH XQA launch.
++
++    For q>1 the patched launcher counts independent query-token blocks before
++    choosing KV sequence splits.  This keeps prompt chunks from multiplying
++    scratch by both dimensions while retaining the original MTP/decode launch
++    for the small q lengths where there is only one query-token block.
++    """
++    token_blocks_per_group = (
++        1
++        if q_len == 1
++        else cdiv(
++            q_len * head_group_ratio,
++            FLASHINFER_XQA_ROWS_PER_SPEC_BLOCK,
++        )
++    )
++    parallel_groups = batch_size * num_kv_heads * token_blocks_per_group
++    subseqs_per_group = min(
++        max(1, sm_count // parallel_groups),
++        cdiv(max_seq_len, FLASHINFER_XQA_CTA_TILE_SEQ_LEN),
++    )
++    # With one sequence split XQA writes directly to output and does not touch
++    # either the semaphore or partial-output scratch regions.
++    if subseqs_per_group == 1:
++        return FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE
++
++    valid_rows = (
++        head_group_ratio
++        if q_len == 1
++        else FLASHINFER_XQA_ROWS_PER_SPEC_BLOCK
++    )
++    warp_tile_rows = cdiv(valid_rows, 16) * 16
++    row_stats_size = (
++        cdiv(warp_tile_rows, 32)
++        * FLASHINFER_XQA_ROW_STATS_BYTES_PER_WARP_TILE
++    )
++    partial_output_size = (
++        valid_rows * head_dim * FLASHINFER_XQA_INPUT_ELEM_SIZE
++    )
++    num_subseqs = subseqs_per_group * parallel_groups
++    row_stats_end = 2 * row_stats_size * num_subseqs
++    partials_begin = cdiv(row_stats_end, partial_output_size) * partial_output_size
++    return (
++        FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE
++        + partials_begin
++        + partial_output_size * num_subseqs
++    )
++
++
+ @triton.jit
+ def _trtllm_prefill_attn_kvfp8_dequant(
+     kv_cache_ptr,
+@@ -461,9 +520,18 @@
+ class FlashInferBackend(AttentionBackend):
+     @classmethod
+     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+-        """NVFP4 stores K and V as separate per-head slots of packed fp4 data
+-        plus fp8 block scales."""
+-        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
++        """Publish packed cache geometry for formats with inline metadata."""
++        if spec.state_content_bytes is not None:
++            return spec
++
++        if spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD:
++            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
++
++            # Share Triton's compact ABI:
++            # [K int8[H], K fp32 scale, V int8[H], V fp32 scale].
++            return TritonAttentionBackend.customize_spec(spec)
++
++        if not spec.kv_quant_mode.is_nvfp4:
+             return spec
+         hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
+         hs_v = nvfp4_kv_cache_full_dim(spec.head_size_v)
+@@ -482,6 +550,7 @@
+         "fp8",
+         "fp8_e4m3",
+         "fp8_e5m2",
++        "int8_per_token_head",
+         "nvfp4",
+         "nvfp4_4over6",
+     ]
+@@ -542,6 +611,18 @@
+         head_size: int,
+         cache_dtype_str: str = "auto",
+     ) -> tuple[int, ...]:
++        if cache_dtype_str == "int8_per_token_head":
++            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
++
++            # state_content_bytes and the logical tensor shape must describe
++            # the same 520-byte record when head_size == 256.
++            return TritonAttentionBackend.get_kv_cache_shape(
++                num_blocks,
++                block_size,
++                num_kv_heads,
++                head_size,
++                cache_dtype_str,
++            )
+         if cache_dtype_str.startswith("nvfp4"):
+             full_dim = nvfp4_kv_cache_full_dim(head_size)
+             return (num_blocks, 2 * num_kv_heads, block_size, full_dim)
+@@ -778,6 +859,32 @@
+         self.attention_config = vllm_config.attention_config
+         self._workspace_buffer = None
+         self._native_workspace_size = 0
++        self._int8_pth_builder: Any | None = None
++        if kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD:
++            from vllm.v1.attention.backends.triton_attn import (
++                TritonAttentionMetadataBuilder,
++            )
++
++            # FlashInfer's native PTH path consumes the same metadata and cache
++            # ABI as Triton. Unsupported attention features stay on Triton.
++            self._int8_pth_builder = TritonAttentionMetadataBuilder(
++                kv_cache_spec, layer_names, vllm_config, device
++            )
++            self.reorder_batch_threshold = (
++                self._int8_pth_builder.reorder_batch_threshold
++            )
++            self.supports_draft_decode_metadata_update = (
++                self._int8_pth_builder.supports_draft_decode_metadata_update
++            )
++            self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
++            # Allocate before graph capture/model profiling. Native PTH XQA
++            # uses the whole arena (including its semaphore prefix).
++            workspace_buffer = _get_shared_workspace_buffer(device)
++            self._workspace_buffer = workspace_buffer[
++                FLASHINFER_XQA_SEMAPHORE_BUFFER_SIZE:
++            ]
++            return
++
+         self._prefill_wrapper: (
+             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+         ) = None  # Wrapper for prefill/append
+@@ -1591,12 +1698,62 @@
+         )
+         return paged_kv_indices
+ 
++    def _add_int8_pth_xqa_metadata(
++        self,
++        metadata: Any,
++        common_attn_metadata: CommonAttentionMetadata,
++    ) -> Any:
++        """Attach uniform/ragged query metadata consumed by native PTH XQA."""
++        num_reqs = common_attn_metadata.num_reqs
++        q_starts_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
++        q_lens_cpu = q_starts_cpu[1:] - q_starts_cpu[:-1]
++        q_lens = [int(length) for length in q_lens_cpu.tolist()]
++        q_len = max(q_lens, default=1)
++
++        metadata.xqa_q_len_per_req = max(1, q_len)
++        metadata.xqa_q_cu_seq_lens = None
++        metadata.xqa_mask = None
++        if q_len <= 1:
++            return metadata
++        if any(length != q_len for length in q_lens):
++            metadata.xqa_q_cu_seq_lens = common_attn_metadata.query_start_loc[
++                : num_reqs + 1
++            ]
++        return metadata
++
++    def build_for_cudagraph_capture(
++        self, common_attn_metadata: CommonAttentionMetadata
++    ) -> Any:
++        if self._int8_pth_builder is not None:
++            metadata = self._int8_pth_builder.build_for_cudagraph_capture(
++                common_attn_metadata
++            )
++            return self._add_int8_pth_xqa_metadata(
++                metadata, common_attn_metadata
++            )
++        return super().build_for_cudagraph_capture(common_attn_metadata)
++
++    def update_draft_decode_metadata(self, metadata: Any) -> None:
++        if self._int8_pth_builder is None:
++            raise NotImplementedError
++        self._int8_pth_builder.update_draft_decode_metadata(metadata)
++
+     def build(
+         self,
+         common_prefix_len: int,
+         common_attn_metadata: CommonAttentionMetadata,
+         fast_build: bool = False,
+     ) -> FlashInferMetadata:
++        if self._int8_pth_builder is not None:
++            metadata = self._int8_pth_builder.build(
++                common_prefix_len,
++                common_attn_metadata,
++                fast_build,
++            )
++            return self._add_int8_pth_xqa_metadata(
++                metadata, common_attn_metadata
++            )
++
+         num_reqs = common_attn_metadata.num_reqs
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
+         causal = common_attn_metadata.causal
+@@ -2130,6 +2287,55 @@
+         else:
+             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+ 
++        self._int8_pth_impl: Any | None = None
++        self._int8_pth_native_decode = False
++        self._int8_pth_sm_count = 0
++        if kv_cache_dtype == "int8_per_token_head":
++            from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
++
++            self._int8_pth_impl = TritonAttentionImpl(
++                num_heads=num_heads,
++                head_size=head_size,
++                scale=scale,
++                num_kv_heads=num_kv_heads,
++                alibi_slopes=alibi_slopes,
++                sliding_window=sliding_window,
++                kv_cache_dtype=kv_cache_dtype,
++                logits_soft_cap=logits_soft_cap,
++                attn_type=attn_type,
++                kv_sharing_target_layer_name=kv_sharing_target_layer_name,
++                sinks=sinks,
++            )
++            native_int8_pth_enabled = (
++                os.environ.get("VLLM_FLASHINFER_INT8_PTH_NATIVE", "1") == "1"
++            )
++            self._int8_pth_native_decode = (
++                native_int8_pth_enabled
++                and head_size == 256
++                and current_platform.is_device_capability_family(120)
++                and vllm_config is not None
++                and vllm_config.parallel_config.decode_context_parallel_size == 1
++            )
++            if self._int8_pth_native_decode:
++                self._int8_pth_sm_count = torch.cuda.get_device_properties(
++                    _canonical_cuda_device("cuda")
++                ).multi_processor_count
++            if not native_int8_pth_enabled:
++                logger.info_once(
++                    "FlashInfer INT8 per-token/head enabled: native XQA disabled "
++                    "by VLLM_FLASHINFER_INT8_PTH_NATIVE=0; using Triton for all "
++                    "attention shapes."
++                )
++            else:
++                logger.info_once(
++                    "FlashInfer INT8 per-token/head enabled: native XQA for "
++                    "SM12x causal decode, MTP (validated through MTP=3), and "
++                    "uniform/ragged prompt "
++                    "chunks%s; Triton fallback for unsupported features or "
++                    "workspace-exceeding shapes.",
++                    "" if self._int8_pth_native_decode else " is unavailable",
++                )
++
+     def fused_output_quant_supported(self, quant_key: QuantKey):
+         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
+         # (SM100+) here.  Without that we cannot fuse the output quant.
+@@ -2151,6 +2357,157 @@
+             self.sinks = source_sinks.to(torch.float32)
+         else:
+             self.sinks.copy_(source_sinks)
++        if self._int8_pth_impl is not None:
++            self._int8_pth_impl.sinks = self.sinks
++
++    def _forward_native_int8_pth_xqa(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata: Any,
++        output: torch.Tensor,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert self._int8_pth_impl is not None
++        fallback = self._int8_pth_impl.forward
++
++        def run_fallback() -> torch.Tensor:
++            return fallback(
++                layer,
++                query,
++                key,
++                value,
++                kv_cache,
++                attn_metadata,
++                output,
++                output_scale=output_scale,
++                output_block_scale=output_block_scale,
++            )
++
++        if (
++            not self._int8_pth_native_decode
++            or query.dtype not in (torch.float16, torch.bfloat16)
++            or getattr(attn_metadata, "causal", True) is not True
++            or getattr(attn_metadata, "use_cascade", False)
++            or output_scale is not None
++            or output_block_scale is not None
++            or self.alibi_slopes is not None
++            or bool(self.logits_soft_cap)
++            or self.sinks is not None
++            or getattr(attn_metadata, "mm_prefix_range_tensor", None) is not None
++        ):
++            return run_fallback()
++
++        num_tokens = attn_metadata.num_actual_tokens
++        seq_lens = attn_metadata.seq_lens
++        block_table = attn_metadata.block_table
++        num_reqs = seq_lens.numel()
++        q_len_per_req = int(
++            getattr(
++                attn_metadata,
++                "xqa_q_len_per_req",
++                getattr(attn_metadata, "max_query_len", 0),
++            )
++        )
++        q_cu_seq_lens = getattr(
++            attn_metadata, "xqa_q_cu_seq_lens", None
++        )
++        mask = getattr(attn_metadata, "xqa_mask", None)
++        is_uniform = q_cu_seq_lens is None
++        if (
++            num_tokens <= 0
++            or num_reqs <= 0
++            or q_len_per_req <= 0
++            or query.shape[0] < num_tokens
++            or output.shape[0] < num_tokens
++            or not seq_lens.is_contiguous()
++            or seq_lens.device != query.device
++            or not block_table.is_contiguous()
++            or block_table.device != query.device
++            or block_table.shape[0] != num_reqs
++            or (is_uniform and num_tokens != num_reqs * q_len_per_req)
++            or (not is_uniform and num_tokens > num_reqs * q_len_per_req)
++            or (
++                not is_uniform
++                and (
++                    q_len_per_req <= 1
++                    or q_cu_seq_lens.dtype not in (torch.int32, torch.uint32)
++                    or q_cu_seq_lens.numel() != num_reqs + 1
++                    or not q_cu_seq_lens.is_contiguous()
++                    or q_cu_seq_lens.device != query.device
++                )
++            )
++        ):
++            return run_fallback()
++
++        if q_len_per_req > 1 and mask is not None and (
++            mask.dtype != torch.uint16
++            or mask.device != query.device
++            or not mask.is_contiguous()
++            or mask.shape[-1] != cdiv(q_len_per_req, 32) * 2
++            or mask.numel()
++            != num_tokens * cdiv(q_len_per_req, 32) * 2
++        ):
++            return run_fallback()
++
++        self._int8_pth_impl._ensure_scale_caches(kv_cache)
++        key_full, value_full = self._int8_pth_impl._pth_key_value_caches(kv_cache)
++        key_cache = key_full[..., : self.head_size]
++        value_cache = value_full[..., : self.head_size]
++        k_scale = self._int8_pth_impl._k_scale_cache
++        v_scale = self._int8_pth_impl._v_scale_cache
++        assert k_scale is not None and v_scale is not None
++
++        workspace_buffer = _get_trtllm_workspace_buffer()
++        kernel_max_seq_len = block_table.shape[1] * key_cache.shape[1]
++        required_workspace = _int8_pth_xqa_required_workspace_size(
++            batch_size=num_reqs,
++            num_kv_heads=self.num_kv_heads,
++            head_group_ratio=self.num_queries_per_kv,
++            head_dim=self.head_size,
++            q_len=q_len_per_req,
++            max_seq_len=kernel_max_seq_len,
++            sm_count=self._int8_pth_sm_count,
++        )
++        workspace_size = (
++            workspace_buffer.numel() * workspace_buffer.element_size()
++        )
++        if required_workspace > workspace_size:
++            logger.warning_once(
++                "FlashInfer native INT8 per-token/head XQA needs %.2f MiB "
++                "for query length %d, batch %d, and this page-table extent, "
++                "but the shared workspace is %.2f MiB; using Triton fallback.",
++                required_workspace / (1 << 20),
++                q_len_per_req,
++                num_reqs,
++                workspace_size / (1 << 20),
++            )
++            return run_fallback()
++
++        flashinfer_xqa_batch_decode_with_kv_cache(
++            query=query[:num_tokens].contiguous(),
++            kv_cache=(key_cache, value_cache),
++            workspace_buffer=workspace_buffer,
++            block_tables=block_table,
++            seq_lens=seq_lens,
++            max_seq_len=kernel_max_seq_len,
++            bmm1_scale=self.scale,
++            bmm2_scale=1.0,
++            window_left=self.window_left,
++            out=output[:num_tokens],
++            sinks=None,
++            kv_layout="NHD",
++            q_len_per_req=q_len_per_req,
++            q_cu_seq_lens=q_cu_seq_lens,
++            mask=mask,
++            o_scale=1.0,
++            kv_cache_pth_scale=(k_scale, v_scale),
++        )
++        return output
+ 
+     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
+         bmm1_scale = self.scale
+@@ -2211,6 +2568,19 @@
+         if attn_metadata is None:
+             # Profiling run.
+             return output.fill_(0)
++
++        if self._int8_pth_impl is not None:
++            return self._forward_native_int8_pth_xqa(
++                layer,
++                query,
++                key,
++                value,
++                kv_cache,
++                attn_metadata,
++                output,
++                output_scale=output_scale,
++                output_block_scale=output_block_scale,
++            )
+ 
+         if self.bmm1_scale is None:
+             self.bmm1_scale = self.scale
+@@ -2812,6 +3182,16 @@
+         slot_mapping: torch.Tensor,
+     ) -> None:
+         if self.kv_sharing_target_layer_name is None:
++            if self._int8_pth_impl is not None:
++                self._int8_pth_impl.do_kv_cache_update(
++                    layer,
++                    key,
++                    value,
++                    kv_cache,
++                    slot_mapping,
++                )
++                return
++
+             # Reshape the input keys and values and store them in the cache.
+             # Skip this if sharing KV cache with an earlier attention layer.
+             # NOTE(woosuk): Here, key and value are padded while slot_mapping is
+--- a/flashinfer/jit/xqa.py
++++ b/flashinfer/jit/xqa.py
+@@ -60,7 +60,23 @@
+     output_dtype: torch.dtype,
+     q_seq_len: int = 1,
+     use_ragged_q: bool = False,
++    use_pth_scale: bool = False,
+ ) -> JitSpec:
++    if use_pth_scale:
++        if kv_cache_dtype != torch.int8 or head_dim != 256 or q_seq_len < 1:
++            raise ValueError(
++                "INT8 per-token/head XQA requires int8 KV, head_dim=256, "
++                "and q_seq_len>=1"
++            )
++        if output_dtype not in (input_dtype, torch.float32):
++            raise ValueError(
++                "INT8 per-token/head XQA does not support low-precision output"
++            )
++    fp32_output = output_dtype == torch.float32
++    if fp32_output and not (
++        use_pth_scale and input_dtype == torch.bfloat16 and head_group_ratio == 6
++    ):
++        raise ValueError("FP32 XQA output requires BF16 Q, PTH INT8, H256/GQA6")
+     if input_dtype == torch.float16:
+         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
+     elif input_dtype == torch.bfloat16:
+@@ -126,7 +142,8 @@
+ 
+     compilation_context = CompilationContext()
+     nvcc_flags = compilation_context.get_nvcc_flags_list(
+-        supported_major_versions=[9, 10, 12], map_sm107_to_100f=True
++        supported_major_versions=([12] if use_pth_scale else [9, 10, 12]),
++        map_sm107_to_100f=True,
+     )
+     sm_nvcc_flags = nvcc_flags
+ 
+@@ -138,7 +155,7 @@
+         jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
+     ]
+ 
+-    if _has_sm90_target():
++    if (not use_pth_scale) and _has_sm90_target():
+         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
+         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
+         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
+@@ -148,8 +165,14 @@
+     # Suffix the URI only when ragged Q actually changes the compile flags
+     # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
+     ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
++    pth_suffix = "_int8_pth" if use_pth_scale else ""
++    if use_pth_scale:
++        pth_suffix += "_fixed_k8_v3_fp32_output_v3"
++    flag_pth_scale = [f"-DUSE_PTH_SCALE={1 if use_pth_scale else 0}"]
++    if use_pth_scale:
++        flag_pth_scale.append("-DPTH_FIXED_K8_COPY=1")
+     return gen_jit_spec(
+-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
++        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{('f32' if fp32_output else filename_safe_dtype_map[output_dtype])}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{pth_suffix}",
+         sources,
+         extra_cuda_cflags=xqa_nvcc_flags
+         + sm_nvcc_flags
+@@ -162,7 +185,9 @@
+         + flag_low_prec_output
+         + flag_spec_dec
+         + flag_mla_wrapper
+-        + flag_sm90_mha,
++        + flag_sm90_mha
++        + flag_pth_scale
++        + [f"-DPTH_FP32_OUTPUT={int(fp32_output)}"],
+         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
+     )
+ 
+--- a/flashinfer/xqa.py
++++ b/flashinfer/xqa.py
+@@ -37,6 +37,40 @@
+ )
+ 
+ 
++def _pth_xqa_scratch_size(
++    batch_size: int,
++    num_kv_heads: int,
++    head_group_ratio: int,
++    head_dim: int,
++    q_seq_len: int,
++    max_seq_len: int,
++    sm_count: int,
++    input_element_size: int,
++) -> int:
++    """Scratch bytes required by the patched PTH XQA split policy."""
++    token_blocks = (
++        1 if q_seq_len == 1 else (q_seq_len * head_group_ratio + 31) // 32
++    )
++    parallel_groups = batch_size * num_kv_heads * token_blocks
++    subseqs = min(
++        max(1, sm_count // parallel_groups),
++        (max_seq_len + 255) // 256,
++    )
++    if subseqs == 1:
++        return 0
++
++    valid_rows = head_group_ratio if q_seq_len == 1 else 32
++    warp_tile_rows = ((valid_rows + 15) // 16) * 16
++    row_stats_size = ((warp_tile_rows + 31) // 32) * 128
++    partial_output_size = valid_rows * head_dim * input_element_size
++    num_subseqs = subseqs * parallel_groups
++    row_stats_end = 2 * row_stats_size * num_subseqs
++    partials_begin = (
++        (row_stats_end + partial_output_size - 1) // partial_output_size
++    ) * partial_output_size
++    return partials_begin + partial_output_size * num_subseqs
++
++
+ def get_xqa_module(
+     input_dtype: torch.dtype,
+     kv_cache_dtype: torch.dtype,
+@@ -47,7 +81,17 @@
+     output_dtype: torch.dtype,
+     q_seq_len: int,
+     use_ragged_q: bool = False,
++    use_pth_scale: bool = False,
+ ):
++    if use_pth_scale and (
++        use_ragged_q or not swap_ab_eligible(q_seq_len, head_group_ratio)
++    ):
++        # PTH prefill lengths are workload-dependent.  The generic SPEC_DEC
++        # kernel takes q_seq_len at run time, so collapse every non-SWAP_AB
++        # shape (and ragged MTP shape) onto one JIT module instead of compiling
++        # a new CUDA extension for every prompt chunk length.
++        q_seq_len = max(2, 32 // head_group_ratio + 1)
++        use_ragged_q = False
+     # Ragged Q must reuse the uniform module unless it changes the compile
+     # flags; a second cache entry would re-register the same torch op.
+     use_ragged_q = use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio)
+@@ -61,6 +105,7 @@
+         output_dtype,
+         q_seq_len,
+         use_ragged_q,
++        use_pth_scale,
+     )
+ 
+ 
+@@ -75,6 +120,7 @@
+     output_dtype: torch.dtype,
+     q_seq_len: int,
+     use_ragged_q: bool,
++    use_pth_scale: bool,
+ ):
+     spec = gen_xqa_module(
+         input_dtype,
+@@ -86,6 +132,7 @@
+         output_dtype,
+         q_seq_len,
+         use_ragged_q,
++        use_pth_scale,
+     )
+     # Reuse the JIT module URI so the two names can never drift apart.
+     op_name = f"flashinfer::{spec.name}"
+@@ -210,6 +257,8 @@
+     q_cu_seq_lens: Optional[torch.Tensor] = None,
+     k_sf_cache: Optional[torch.Tensor] = None,
+     v_sf_cache: Optional[torch.Tensor] = None,
++    k_pth_scale_cache: Optional[torch.Tensor] = None,
++    v_pth_scale_cache: Optional[torch.Tensor] = None,
+ ) -> None:
+     r"""Apply attention with paged KV cache using XQA kernel.
+     Parameters
+@@ -290,6 +339,7 @@
+         32) * 2``, or ``[total_q_tokens, mask_size_per_row]`` with ragged Q,
+         where each request's rows cover its own draft length.
+         Data type should be torch.uint16 (bit-packed format, aligned to 32 bits).
++        With INT8 per-token/head scales, None selects causal attention directly.
+     q_cu_seq_lens : Optional[torch.Tensor], default=None
+         Cumulative draft lengths ``[batch_size + 1]`` (torch.int32 or
+         torch.uint32, on device) enabling ragged Q: requests may have
+@@ -372,7 +422,12 @@
+             "KV cache must be fp8 when output is fp8"
+         )
+     else:
+-        assert output.dtype == q.dtype, "Output and query must have the same dtype"
++        assert output.dtype == q.dtype or (
++            output.dtype == torch.float32
++            and q.dtype == torch.bfloat16
++            and head_dim == 256 and head_group_ratio == 6
++            and k_pth_scale_cache is not None and v_pth_scale_cache is not None
++        ), "Unsupported output dtype"
+ 
+     # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
+     if kv_layout == "HND":
+@@ -383,6 +438,10 @@
+             k_sf_cache = k_sf_cache.transpose(-3, -2)
+         if v_sf_cache is not None:
+             v_sf_cache = v_sf_cache.transpose(-3, -2)
++        if k_pth_scale_cache is not None:
++            k_pth_scale_cache = k_pth_scale_cache.transpose(-2, -1)
++        if v_pth_scale_cache is not None:
++            v_pth_scale_cache = v_pth_scale_cache.transpose(-2, -1)
+     if (
+         k_cache.dtype == torch.float8_e4m3fn
+         and get_compute_capability(torch.device(device="cuda"))[0] == 9
+@@ -397,6 +456,60 @@
+         )
+         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
+         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
++
++    use_pth_scale = (
++        k_pth_scale_cache is not None or v_pth_scale_cache is not None
++    )
++    if use_pth_scale:
++        assert k_pth_scale_cache is not None and v_pth_scale_cache is not None
++        assert k_sf_cache is None and v_sf_cache is None, (
++            "per-token/head and NVFP4 sidecar scales are mutually exclusive"
++        )
++        assert k_cache.dtype == torch.int8, (
++            "per-token/head XQA requires int8 K/V"
++        )
++        assert head_dim == 256 and q_seq_len >= 1
++        assert output.dtype in (q.dtype, torch.float32) and q.dtype in (
++            torch.float16,
++            torch.bfloat16,
++        )
++        assert get_compute_capability(q.device)[0] == 12, (
++            "per-token/head XQA is supported only on SM120/SM121"
++        )
++        expected_shape = k_cache.shape[:-1]
++        for name, scale_cache in (
++            ("K", k_pth_scale_cache),
++            ("V", v_pth_scale_cache),
++        ):
++            assert scale_cache.dtype == torch.float32
++            assert scale_cache.device == q.device
++            assert tuple(scale_cache.shape) == tuple(expected_shape), (
++                f"{name} per-token/head scale shape {scale_cache.shape} "
++                f"does not match {expected_shape}"
++            )
++
++        required_scratch = _pth_xqa_scratch_size(
++            batch_size,
++            num_kv_heads,
++            head_group_ratio,
++            head_dim,
++            q_seq_len,
++            max_seq_len,
++            sm_count,
++            q.element_size(),
++        )
++        available_scratch = workspace_buffer.numel() * workspace_buffer.element_size()
++        if available_scratch < required_scratch:
++            raise ValueError(
++                "INT8 per-token/head XQA workspace is too small for this "
++                f"shape: need {required_scratch} scratch bytes, got "
++                f"{available_scratch}"
++            )
++
++        # The compiled wrapper already carries two optional sidecar tensors.
++        # In this specialization they contain FP32 per-token/head scales.
++        k_sf_cache = k_pth_scale_cache
++        v_sf_cache = v_pth_scale_cache
+ 
+     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
+         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
+@@ -411,10 +524,11 @@
+         output.dtype,
+         q_seq_len,
+         use_ragged_q,
++        use_pth_scale,
+     )
+ 
+     if q_seq_len > 1:
+-        assert mask is not None, "Mask is required for speculative decoding"
++        assert mask is not None or use_pth_scale, "Mask is required for speculative decoding"
+         if sinks is not None:
+             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
+         if (
+--- a/flashinfer/decode.py
++++ b/flashinfer/decode.py
+@@ -3544,6 +3544,7 @@
+         torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]
+     ] = None,
+     q_cu_seq_lens: Optional[torch.Tensor] = None,
++    kv_cache_pth_scale: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+ ) -> torch.Tensor:
+     """
+     Parameters
+@@ -3641,6 +3642,8 @@
+ 
+     k_cache_sf = None
+     v_cache_sf = None
++    k_cache_pth_scale = None
++    v_cache_pth_scale = None
+     if kv_cache_sf is not None:
+         if isinstance(kv_cache_sf, tuple):
+             k_cache_sf, v_cache_sf = kv_cache_sf
+@@ -3651,6 +3654,13 @@
+             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+             # it doesn't change underlying storage
+             k_cache_sf, v_cache_sf = kv_cache_sf.unbind(dim=1)
++
++    if kv_cache_pth_scale is not None:
++        assert kv_cache_sf is None, (
++            "per-token/head and NVFP4 sidecar scales are mutually exclusive"
++        )
++        assert isinstance(kv_cache_pth_scale, tuple) and len(kv_cache_pth_scale) == 2
++        k_cache_pth_scale, v_cache_pth_scale = kv_cache_pth_scale
+ 
+     sm_count = get_device_sm_count(query.device)
+ 
+@@ -3672,8 +3682,15 @@
+     workspace_u8 = workspace_buffer.view(torch.uint8)
+     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
+     scratch = workspace_u8[8 * 1024 * 1024 :]
+-    kv_scale_value = bmm2_scale * o_scale
+-    q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
++    if kv_cache_pth_scale is not None:
++        assert q_len_per_req is not None and q_len_per_req >= 1
++        assert not isinstance(bmm2_scale, torch.Tensor) and float(bmm2_scale) == 1.0
++        assert o_scale is not None and float(o_scale) == 1.0
++        kv_scale_value = 1.0
++        q_scale_value = bmm1_scale * (head_dim**0.5)
++    else:
++        kv_scale_value = bmm2_scale * o_scale
++        q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
+ 
+     if q_cu_seq_lens is not None:
+         # Ragged Q: query stays packed as [total_q_tokens, num_heads, head_dim]
+@@ -3712,6 +3729,8 @@
+         page_size,
+         k_sf_cache=k_cache_sf,
+         v_sf_cache=v_cache_sf,
++        k_pth_scale_cache=k_cache_pth_scale,
++        v_pth_scale_cache=v_cache_pth_scale,
+         sinks=sinks_new,
+         q_scale=q_scale_value,
+         kv_scale=kv_scale_value,
+--- a/flashinfer/data/csrc/xqa/mha.h
++++ b/flashinfer/data/csrc/xqa/mha.h
+@@ -21,6 +21,9 @@
+ #endif
+ #include "defines.h"
+ #include "utils.h"
++#ifndef USE_PTH_SCALE
++#define USE_PTH_SCALE 0
++#endif
+ #if SPEC_DEC
+ #include "specDec.h"
+ #endif
+@@ -66,6 +69,17 @@
+ 
+ constexpr uint32_t validElemsPerKHead = validElemsPerHead;
+ constexpr bool lowPrecOutput = LOW_PREC_OUTPUT;
++#if USE_PTH_SCALE
++static_assert(CACHE_ELEM_ENUM == 1, "PTH XQA supports INT8 cache only");
++static_assert(validElemsPerHead == 256, "PTH XQA requires head_dim=256");
++static_assert(beamWidth == 1 && !lowPrecOutput,
++              "PTH XQA supports only beam-width 1 with native-precision output");
++// PTH records include inline FP32 scales, so data strides are not generally
++// integral multiples of GMemCacheHead.
++using KVCacheStrideType = uint64_t;
++#else
++using KVCacheStrideType = uint32_t;
++#endif
+ 
+ #if IS_MLA
+ constexpr uint32_t validElemsPerVHead = 512;
+@@ -73,7 +87,11 @@
+ using OutputHead = Vec<__nv_bfloat16, validElemsPerVHead>;
+ #else
+ constexpr uint32_t validElemsPerVHead = validElemsPerHead;
++#if PTH_FP32_OUTPUT
++using OutputHead = Vec<float, validElemsPerVHead>;
++#else
+ using OutputHead = mha::conditional_t<lowPrecOutput, GMemCacheHead, InputHead>;
++#endif
+ #endif
+ using OutputElem = OutputHead::Elem;
+ 
+@@ -137,6 +155,11 @@
+ #endif
+     uint32_t batchSize, float kvCacheScale,
+     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
++#if USE_PTH_SCALE
++    float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++    uint64_t k_pth_stride_page, uint64_t k_pth_stride_token, uint64_t k_pth_stride_head,
++    uint64_t v_pth_stride_page, uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
+ #if SPEC_DEC
+     SpecDecParams const& specDecParams,
+ #endif
+@@ -160,6 +183,12 @@
+                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+                          uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
+                          float const* kvScalePtr,
++#if USE_PTH_SCALE
++                         float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++                         uint64_t k_pth_stride_page, uint64_t k_pth_stride_token,
++                         uint64_t k_pth_stride_head, uint64_t v_pth_stride_page,
++                         uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
+ #if SPEC_DEC
+                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+ #endif
+--- a/flashinfer/data/csrc/xqa/mhaUtils.cuh
++++ b/flashinfer/data/csrc/xqa/mhaUtils.cuh
+@@ -71,19 +71,29 @@
+   Vec<KVCachePageIndex, nbPages> pageIndices;
+   uint32_t tokenOffset;   // token offset within the first page
+   uint32_t headIdx;       // head index
+-  uint32_t stride_page;   // stride for each page (in units of Head)
+-  uint32_t stride_token;  // stride for each token (in units of Head)
+-  uint32_t stride_head;   // stride for each head (in units of Head)
++  KVCacheStrideType stride_page;
++  KVCacheStrideType stride_token;
++  KVCacheStrideType stride_head;
+ 
+   __device__ inline Head& operator[](uint32_t i) const { return *(*this + i); }
+ 
+   __device__ inline Head* operator+(uint32_t i) const {
+     uint32_t const absoluteTokenIdx = tokenOffset + i;
+     auto const pageIdx = pageIndices[nbPages == 1 ? 0U : absoluteTokenIdx / tokensPerPage];
+-    return (pageIdx & (1U << 31))
+-               ? nullptr
+-               : pool + pageIdx * stride_page + (absoluteTokenIdx % tokensPerPage) * stride_token +
+-                     headIdx * stride_head;
++    if (pageIdx & (1U << 31)) return nullptr;
++#if USE_PTH_SCALE
++    // vLLM packs [K | K-scale | V | V-scale] into each token/head record.
++    // The strides are raw int8 elements, not whole GMemCacheHead objects.
++    uint64_t const offset =
++        uint64_t(pageIdx) * stride_page +
++        uint64_t(absoluteTokenIdx % tokensPerPage) * stride_token +
++        uint64_t(headIdx) * stride_head;
++    return reinterpret_cast<Head*>(reinterpret_cast<uintptr_t>(pool) +
++                                   offset * sizeof(CacheElem));
++#else
++    return pool + pageIdx * stride_page +
++           (absoluteTokenIdx % tokensPerPage) * stride_token + headIdx * stride_head;
++#endif
+   }
+ };
+ 
+@@ -97,10 +107,28 @@
+ // using SrcHeadPtr = IndexedHeadPtr<Head>;
+ // #endif
+ 
++#ifndef PTH_FIXED_K8_COPY
++#define PTH_FIXED_K8_COPY 0
++#endif
++
++#if USE_PTH_SCALE && PTH_FIXED_K8_COPY
++// The host validates the K base and every page/token/head stride once.
++// All shared-memory grains are 16-byte aligned. Invalid pages and tail
++// elements still issue both zero-fill copies; there is no alignment branch.
++__device__ inline void copyPthK8GrainAsync(uintptr_t dstAddr, uintptr_t srcAddr,
++                                        bool valid) {
++#pragma unroll
++  for (uint32_t offset = 0; offset < 16; offset += 8) {
++    ldgsts::copyAsync<8>(reinterpret_cast<void*>(dstAddr + offset),
++                        reinterpret_cast<void const*>(srcAddr + offset), valid ? 8u : 0u);
++  }
++}
++#endif
++
+ // @fixme: give evict first hint for last part.
+ template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead,
+           uint32_t grainBytesSmem, uint32_t grainBytesGmem, bool swizzle, bool isFull,
+-          uint32_t dstNbHeads, typename SrcHeadPtr, typename _LdGrain,
++          bool fixedPthK8 = false, uint32_t dstNbHeads, typename SrcHeadPtr, typename _LdGrain,
+           typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+ __device__ inline void copyPartialHeadsAsync(
+     Warp const& warp,
+@@ -141,16 +169,44 @@
+     bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
+     SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
+     bool const isValidPage = (pSrcHead != nullptr);
++#if !USE_PTH_SCALE
+     Vec<uint8_t, grainBytesGmem> const* const pSrc =
+         reinterpret_cast<Vec<uint8_t, grainBytesGmem> const*>(pSrcHead) + idxGrainInsideHead;
++#endif
+     Vec<uint8_t, grainBytesSmem>* const pDst = reinterpret_cast<Vec<uint8_t, grainBytesSmem>*>(
+         &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, segLane));
+ #if !ENABLE_4BIT_KV_CACHE
+     // 4-bit KV cache is not bank-conflict free now.
+     assert(!hasBankConflict(pDst));
+ #endif
++#if USE_PTH_SCALE
++    // A compact 520-byte PTH record is only four-byte aligned for some heads
++    // and for V (which follows K's four-byte scale). A 16-byte cp.async from
++    // those addresses has undefined behavior, so split it into naturally
++    // aligned four-byte copies. Destination grains remain unchanged.
++    static_assert(grainBytesGmem == 16 && grainBytesSmem == 16);
++    uintptr_t const srcAddr = reinterpret_cast<uintptr_t>(pSrcHead) +
++                              uint64_t(idxGrainInsideHead) * grainBytesGmem;
++    uintptr_t const dstAddr = reinterpret_cast<uintptr_t>(pDst);
++#if PTH_FIXED_K8_COPY
++    if constexpr (fixedPthK8) {
++      copyPthK8GrainAsync(dstAddr, srcAddr,
++                         isValidPage && isHeadInBound && isGrainInBound);
++    } else
++#endif
++    {
++      uint32_t const copyBytes =
++          isValidPage && isHeadInBound && isGrainInBound ? 4u : 0u;
++#pragma unroll
++      for (uint32_t byteOffset = 0; byteOffset < 16; byteOffset += 4) {
++        ldgsts::copyAsync<4>(reinterpret_cast<void*>(dstAddr + byteOffset),
++                             reinterpret_cast<void const*>(srcAddr + byteOffset), copyBytes);
++      }
++    }
++#else
+     ldgsts::copyAsync<grainBytesGmem>(
+         pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytesGmem : 0u);
++#endif
+   }
+ }
+ 
+@@ -168,7 +224,7 @@
+   uint32_t const warpNbAvailHeads =
+       (dstHeadOffset < nbAvailHeads ? nbAvailHeads - dstHeadOffset : 0);
+   constexpr uint32_t idxPart = 0;
+-  copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, grainBytesSmem, grainBytesGmem, swizzle, isFull,
++  copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, grainBytesSmem, grainBytesGmem, swizzle, isFull, false,
+                         dstNbHeads>(warp, dst, dstHeadOffset, src, idxPart, warpNbAvailHeads,
+                                     [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
+ }
+--- a/flashinfer/data/csrc/xqa/mha.cu
++++ b/flashinfer/data/csrc/xqa/mha.cu
+@@ -459,6 +459,39 @@
+ 
+ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
+ 
++#if PTH_FP32_OUTPUT
++__device__ inline void storeFp32Output(WarpAcc const& acc, OutputHead* output,
++                                      uint32_t nbQHeads, uint32_t firstHead,
++                                      uint32_t firstRow, uint32_t validRows,
++                                      uint32_t warpInGroup, bool reorder) {
++  static_assert(USE_PTH_SCALE && HEAD_ELEMS == 256 && HEAD_GRP_SIZE == 6);
++  static_assert(gemm1NbWarpGrps == 1 && beamWidth == 1 && !lowPrecOutput);
++  static_assert(mha::is_same_v<OutputElem, float>);
++#pragma unroll
++  for (uint32_t m = 0; m < WarpAcc::rows; ++m) {
++#pragma unroll
++    for (uint32_t i = 0; i < InstAcc::rows; ++i) {
++      uint32_t const row = 16 * m + 8 * i + laneId() / 4;
++      if (row >= validRows) continue;
++      uint32_t const headToken = firstRow + row;
++      uint32_t const head = firstHead + (headToken / headGrpSize) * nbQHeads
++                            + headToken % headGrpSize;
++#pragma unroll
++      for (uint32_t n = 0; n < WarpAcc::cols; ++n) {
++#pragma unroll
++        for (uint32_t j = 0; j < InstAcc::cols; ++j) {
++          uint32_t const col = warpInGroup * warpTile.x +
++              (reorder ? 16 * (n / 2) + 4 * (laneId() % 4) + n % 2 + 2 * j
++                       : 8 * n + 2 * (laneId() % 4) + j);
++          output[head][col] = acc(m, n)(i, j);
++        }
++      }
++    }
++  }
++}
++#endif
++
++
+ #if SPEC_DEC
+ #define MMAS_N_PER_MASK 2
+ 
+@@ -473,6 +506,34 @@
+ ) {
+   uint32_t const idxInQuad = laneId() % 4;
+   uint32_t const idxQuad = laneId() / 4;
++#if USE_PTH_SCALE
++  if (mask == nullptr) {
++#pragma unroll
++    for (uint32_t m = 0; m < acc.rows; m++) {
++#pragma unroll
++      for (uint32_t i = 0; i < InstAcc::rows; i++) {
++        uint32_t const tokenRow =
++            min((rowOffset + instM * m + idxQuad + i * 8) / headGrpSize, actualQSeqLen - 1);
++#pragma unroll
++        for (uint32_t n = 0; n < acc.cols; n++) {
++#pragma unroll
++          for (uint32_t j = 0; j < InstAcc::cols; j++) {
++            uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
++            bool const visible = col < nbValidCols &&
++                col + actualQSeqLen <= nbValidCols + tokenRow;
++#if SLIDING_WINDOW
++            bool const inWindow = int32_t(tileTokenBeg + col) >= winBegBase + int32_t(tokenRow);
++#else
++            constexpr bool inWindow = true;
++#endif
++            acc(m, n)(i, j) = visible && inWindow ? acc(m, n)(i, j) : safeInitRowMax;
++          }
++        }
++      }
++    }
++    return;
++  }
++#endif
+   // Packed mask is aligned with 32 bits (2 uint16_t).
+   uint32_t const nbPackedMasksPerRow = divUp(qSeqLen, 32u) * 2u;
+   uint16_t const* uint16Mask = reinterpret_cast<uint16_t const*>(mask);
+@@ -1430,6 +1491,76 @@
+   }
+ }
+ 
++#if USE_PTH_SCALE
++__device__ __forceinline__ float loadPthTokenHeadScale(
++    KVCacheList<true> const& cacheList, float const* scale, uint64_t stridePage,
++    uint64_t strideToken, uint64_t strideHead, uint32_t idxReq, uint32_t idxHead,
++    uint32_t token, uint32_t cacheSeqLen) {
++  if (token >= cacheSeqLen) return 1.0f;
++  uint32_t const logicalPage = token / tokensPerPage;
++  uint32_t const slot = token % tokensPerPage;
++  KVCachePageIndex const page =
++      cacheList.kvCachePageList[uint64_t(idxReq) * cacheList.maxNbPagesPerSeq + logicalPage];
++  if (page < 0) return 1.0f;
++  return __ldg(scale + uint64_t(page) * stridePage + uint64_t(slot) * strideToken +
++                     uint64_t(idxHead) * strideHead);
++}
++
++// Apply one FP32 scale to every score/probability column represented by the
++// lane. K uses baseScale=qkScale before softmax; V uses baseScale=1 after the
++// FP32 exponent and denominator have been computed.
++__device__ inline void rescaleAccPthColumns(
++    WarpAcc& acc, float baseScale, KVCacheList<true> const& cacheList,
++    float const* pthScale, uint64_t stridePage, uint64_t strideToken,
++    uint64_t strideHead, uint32_t idxReq, uint32_t idxHead,
++    uint32_t warpTileTokenBeg, uint32_t cacheSeqLen) {
++  uint32_t const idxInQuad = laneId() % 4;
++#pragma unroll
++  for (uint32_t n = 0; n < acc.cols; ++n) {
++#pragma unroll
++    for (uint32_t j = 0; j < InstAcc::cols; ++j) {
++      uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
++      float const scale = baseScale * loadPthTokenHeadScale(
++                                          cacheList, pthScale, stridePage, strideToken,
++                                          strideHead, idxReq, idxHead,
++                                          warpTileTokenBeg + col, cacheSeqLen);
++#pragma unroll
++      for (uint32_t m = 0; m < acc.rows; ++m) {
++#pragma unroll
++        for (uint32_t i = 0; i < InstAcc::rows; ++i) acc(m, n)(i, j) *= scale;
++      }
++    }
++  }
++}
++
++// Sum FP32 softmax numerators before V scales are applied and before the
++// probabilities are narrowed to the query dtype for the P*V MMA.
++__device__ inline QuadRegRowMax computeRowSumF32(WarpAcc const& acc) {
++  QuadRegRowMax rowSum{};
++#pragma unroll
++  for (uint32_t n = 0; n < acc.cols; ++n) {
++#pragma unroll
++    for (uint32_t j = 0; j < InstAcc::cols; ++j) {
++#pragma unroll
++      for (uint32_t m = 0; m < acc.rows; ++m) {
++#pragma unroll
++        for (uint32_t i = 0; i < InstAcc::rows; ++i) {
++          rowSum[m * InstAcc::rows + i] += acc(m, n)(i, j);
++        }
++      }
++    }
++  }
++#pragma unroll
++  for (uint32_t xorMask = 2; xorMask != 0; xorMask /= 2) {
++#pragma unroll
++    for (uint32_t i = 0; i < rowSum.size; ++i) {
++      rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], xorMask);
++    }
++  }
++  return rowSum;
++}
++#endif
++
+ template <bool useFp32Acc, uint32_t nbWarps, uint32_t nbTiles, uint32_t rows, uint32_t cols>
+ __device__ inline void smemFp16ArraySum(uint32_t idxWarp, Array2D<LdGrain, rows, cols>& dst,
+                                         Array2D<LdGrain, rows, cols> const tiles[nbTiles]) {
+@@ -1573,17 +1704,22 @@
+ #endif
+         uint32_t const batchSize, float kvCacheScale,
+         float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+-        uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
++#if USE_PTH_SCALE
++        float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++        uint64_t k_pth_stride_page, uint64_t k_pth_stride_token,
++        uint64_t k_pth_stride_head, uint64_t v_pth_stride_page,
++        uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
++        KVCacheStrideType kv_stride_page, KVCacheStrideType kv_stride_token,
++        KVCacheStrideType kv_stride_head,
+ #if ENABLE_4BIT_KV_CACHE
+         uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
+ #endif
+         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+ 
+   assert(allowMultiBlockMode || gridDim.x == 1);
+-  bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
+-  uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
++  uint32_t const maxNbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
+   uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? blockIdx.x : 0;
+-  assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
+ 
+   // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of
+   // requests
+@@ -1686,9 +1822,37 @@
+       idxHeadTokenInGrp > totalNbHeadTokensInGrp
+           ? 0u
+           : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
++  // All sequence splits for this query block exit together.
++  if (nbValidHeadTokens == 0) {
++    return;
++  }
+   // Shift the mask ptr by batch_idx.
+-  mask += reqSeqOffset * divUp(qSeqLen, 32u);
+-#endif
++  if (mask != nullptr) {
++    mask += reqSeqOffset * divUp(qSeqLen, 32u);
++  }
++#endif
++
++  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
++#if SPEC_DEC && USE_PTH_SCALE
++  uint32_t const visibleSeqLen = mask == nullptr && cacheSeqLen >= actualQSeqLen
++      ? cacheSeqLen - actualQSeqLen +
++            min(divUp(idxHeadTokenInGrp + nbValidHeadTokens, headGrpSize), actualQSeqLen)
++      : cacheSeqLen;
++#else
++  uint32_t const visibleSeqLen = cacheSeqLen;
++#endif
++  uint32_t const nbSeqIters = useKVCache ? divUp(visibleSeqLen, ctaTile.x) : 0;
++#if USE_PTH_SCALE
++  // Keep graph/scratch geometry fixed; only participating splits vary per request.
++  uint32_t const nbSubSeqPerSeq = min(maxNbSubSeqPerSeq, max(1u, nbSeqIters));
++  if (idxSubSeqInSeq >= nbSubSeqPerSeq) {
++    return;
++  }
++#else
++  uint32_t const nbSubSeqPerSeq = maxNbSubSeqPerSeq;
++#endif
++  bool const isMultiBlock = nbSubSeqPerSeq > 1;
++  assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
+ 
+   constexpr bool qkSwizzle = true;
+   // load whole Q heads into shared memory
+@@ -1758,7 +1922,6 @@
+   }
+ #endif
+ 
+-  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+ #if SLIDING_WINDOW
+   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+ #if SPEC_DEC && !IS_SPEC_DEC_TREE
+@@ -1783,7 +1946,6 @@
+   uint32_t const nbPages = divUp(cacheSeqLen, tokensPerPage);
+   constexpr uint32_t nbPagesPerCtaTile = exactDiv(ctaTile.x, tokensPerPage);
+ 
+-  uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
+ #if SPEC_DEC
+   uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+ #endif
+@@ -1889,7 +2051,7 @@
+       bool const isFullTile = (seqIter + 1 < nbSeqIters);
+       if (isFullTile) {
+         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+-                              grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
++                              grainBytesGmemCache, qkSwizzle, true, true>(warp, dst, dstHeadOffset, src,
+                                                                     idxPart);
+       } else {
+         uint32_t const nbHeadsAvail =
+@@ -1897,7 +2059,7 @@
+                  ? cacheSeqLen - seqOffset
+                  : 0U);  // may also be full but it can be handled correctly anyway
+         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+-                              grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
++                              grainBytesGmemCache, qkSwizzle, false, true>(warp, dst, dstHeadOffset, src,
+                                                                      idxPart, nbHeadsAvail);
+       }
+ #if ENABLE_4BIT_KV_CACHE
+@@ -2036,8 +2198,16 @@
+         pickAccRowsForBeamSearch(warp, acc, tmp, isConvergedTile(seqIter), idxBeam,
+                                  [](float& d, float s) { d = s; });
+       }
+-      // apply qkScale
++      uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
++#if USE_PTH_SCALE
++      // Apply the exact per-token/head K scale to Q*INT8(K) before masking
++      // and softmax.
++      rescaleAccPthColumns(acc, qkScale, cacheList, kPthScaleVLLM,
++                           k_pth_stride_page, k_pth_stride_token, k_pth_stride_head,
++                           idxReq, idxHeadGrp, warpTileTokenBeg, cacheSeqLen);
++#else
+       rescaleAcc(warp, acc, qkScale);
++#endif
+ #if CTA_ROW_MAX_BACKWARD_METHOD == 0
+       QuadRegRowMax initRowMaxQuad;
+       initRowMaxQuad.fill(safeInitRowMax);
+@@ -2058,7 +2228,6 @@
+       QuadRegRowMax initRowMaxQuad = smem.ctaRowMax[warpIdx.y].loadToRegForQuad<true>(warp);
+ #endif
+       // masking
+-      uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
+ #if SPEC_DEC
+ #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+       // Tiles below the last row's window begin (cacheSeqLen - slidingWinSize)
+@@ -2107,8 +2276,18 @@
+       QuadRegRowMax const regRowMax = warpTileOnlineSoftmax(warp, initRowMaxQuad, acc);
+ 
+       // store result and max to shared memory.
++#if USE_PTH_SCALE
++      // V_scale belongs only in the numerator. Keep the denominator as
++      // sum(exp(score)), then scale each FP32 probability column before P*V.
++      QuadRegRowMax const regRowSum = computeRowSumF32(acc);
++      rescaleAccPthColumns(acc, 1.0f, cacheList, vPthScaleVLLM,
++                           v_pth_stride_page, v_pth_stride_token, v_pth_stride_head,
++                           idxReq, idxHeadGrp, warpTileTokenBeg, cacheSeqLen);
++      GemmOutRegTile const fp16Acc = toFp16(acc);
++#else
+       GemmOutRegTile const fp16Acc = toFp16(acc);
+       QuadRegRowMax const regRowSum = computeRowSum(warp, fp16Acc);
++#endif
+ #if CTA_ROW_MAX_BACKWARD_METHOD != 1
+       xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
+ #if CTA_ROW_MAX_BACKWARD_METHOD == 2
+@@ -2593,6 +2772,21 @@
+ #endif
+       rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+     }
++    // Single-block epilogue bypasses BF16 materialization. Split partials stay BF16.
++#if PTH_FP32_OUTPUT
++    if (!isMultiBlock) {
++#if SPEC_DEC
++        storeFp32Output(acc, output + reqSeqOffset * nbQHeads, nbQHeads,
++                        idxHeadGrp * headGrpSize, idxHeadTokenInGrp,
++                        nbValidHeadTokens, warpIdxInGrp, true);
++#else
++        storeFp32Output(acc, output + idxReq * nbQHeads, nbQHeads,
++                        idxHeadGrp * headGrpSize, 0, nbValidRows,
++                        warpIdxInGrp, true);
++#endif
++      return;
++    }
++#endif
+     GemmOutRegTile const outTile = toFp16(acc);
+ 
+     auto mergeAndSaveOutTile = [&](GemmOutRegTile const& tile, bool reorder) {
+@@ -2640,7 +2834,7 @@
+ #else
+       uint32_t const nbSeq = nbKHeads * batchSize;
+ #endif
+-      uint32_t const nbSubSeq = nbSubSeqPerSeq * nbSeq;
++      uint32_t const nbSubSeq = maxNbSubSeqPerSeq * nbSeq;
+       MemSegmenter<false> segmenter{scratch};
+ 
+ #if SPEC_DEC
+@@ -2648,7 +2842,7 @@
+ #else
+       uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
+ #endif
+-      uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
++      uint32_t const idxBufBase = maxNbSubSeqPerSeq * idxSeq;
+       uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
+       // copy row max/sum
+       TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
+@@ -2788,8 +2982,21 @@
+         }
+         __syncthreads();
+         rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
++#if PTH_FP32_OUTPUT
++#if SPEC_DEC
++        storeFp32Output(sumAcc, output + reqSeqOffset * nbQHeads, nbQHeads,
++                        idxHeadGrp * headGrpSize, idxHeadTokenInGrp,
++                        nbValidHeadTokens, warpIdxInGrp, false);
++#else
++        storeFp32Output(sumAcc, output + idxReq * nbQHeads, nbQHeads,
++                        idxHeadGrp * headGrpSize, 0, nbValidRows,
++                        warpIdxInGrp, false);
++#endif
++        ctaShouldWriteOut = false;
++#else
+         GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
+         smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
++#endif
+       }
+     }
+     if (ctaShouldWriteOut && warpGrpIdx == 0) {
+@@ -2853,7 +3060,14 @@
+ #endif
+     uint32_t const batchSize, float kvCacheScale,
+     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+-    uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
++#if USE_PTH_SCALE
++    float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++    uint64_t k_pth_stride_page, uint64_t k_pth_stride_token,
++    uint64_t k_pth_stride_head, uint64_t v_pth_stride_page,
++    uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
++    KVCacheStrideType kv_stride_page, KVCacheStrideType kv_stride_token,
++    KVCacheStrideType kv_stride_head,
+ #if ENABLE_4BIT_KV_CACHE
+     uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
+ #endif
+@@ -2878,8 +3092,12 @@
+ #if BEAM_WIDTH > 1
+                   beamSearchParams,
+ #endif
+-                  batchSize, kvCacheScale, kvScalePtr, kv_stride_page, kv_stride_token,
+-                  kv_stride_head,
++                  batchSize, kvCacheScale, kvScalePtr,
++#if USE_PTH_SCALE
++                  kPthScaleVLLM, vPthScaleVLLM, k_pth_stride_page, k_pth_stride_token,
++                  k_pth_stride_head, v_pth_stride_page, v_pth_stride_token, v_pth_stride_head,
++#endif
++                  kv_stride_page, kv_stride_token, kv_stride_head,
+ #if ENABLE_4BIT_KV_CACHE
+                   sf_stride_page, sf_stride_token, sf_stride_head,
+ #endif
+@@ -2921,6 +3139,12 @@
+ #endif
+     uint32_t batchSize, float kvCacheScale,
+     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
++#if USE_PTH_SCALE
++    float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++    uint64_t k_pth_stride_page, uint64_t k_pth_stride_token,
++    uint64_t k_pth_stride_head, uint64_t v_pth_stride_page,
++    uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
+ #if SPEC_DEC
+     SpecDecParams const& specDecParams,
+ #endif
+@@ -2978,10 +3202,16 @@
+                                     kSfCacheVLLM,    vSfCacheVLLM,
+ #endif
+                                     kvCachePageList, seqLen,       maxNbPagesPerSeq};
+-  // Convert stride from elements to Heads
++#if USE_PTH_SCALE
++  KVCacheStrideType const stride_page_in_heads = kv_stride_page;
++  KVCacheStrideType const stride_token_in_heads = kv_stride_token;
++  KVCacheStrideType const stride_head_in_heads = kv_stride_head;
++#else
++  // Convert stride from elements to Heads.
+   uint32_t const stride_page_in_heads = static_cast<uint32_t>(kv_stride_page / validElemsPerHead);
+   uint32_t const stride_token_in_heads = static_cast<uint32_t>(kv_stride_token / validElemsPerHead);
+   uint32_t const stride_head_in_heads = static_cast<uint32_t>(kv_stride_head / validElemsPerHead);
++#endif
+ #if ENABLE_4BIT_KV_CACHE
+   uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+   uint32_t const sf_stride_page_in_heads =
+@@ -3013,8 +3243,13 @@
+ #if BEAM_WIDTH > 1
+                      beamSearchParams,
+ #endif
+-                     batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
+-                     stride_token_in_heads, stride_head_in_heads,
++                     batchSize, kvCacheScale, kvScalePtr,
++#if USE_PTH_SCALE
++                     kPthScaleVLLM, vPthScaleVLLM, k_pth_stride_page,
++                     k_pth_stride_token, k_pth_stride_head, v_pth_stride_page,
++                     v_pth_stride_token, v_pth_stride_head,
++#endif
++                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
+ #if ENABLE_4BIT_KV_CACHE
+                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
+ #endif
+@@ -3046,6 +3281,12 @@
+                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+                          uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
+                          float const* kvScalePtr,
++#if USE_PTH_SCALE
++                         float const* kPthScaleVLLM, float const* vPthScaleVLLM,
++                         uint64_t k_pth_stride_page, uint64_t k_pth_stride_token,
++                         uint64_t k_pth_stride_head, uint64_t v_pth_stride_page,
++                         uint64_t v_pth_stride_token, uint64_t v_pth_stride_head,
++#endif
+ #if SPEC_DEC
+                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+ #endif
+@@ -3055,15 +3296,26 @@
+                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
+ #endif
+                          cudaStream_t stream) {
++#if SPEC_DEC
++  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
++#endif
+   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
+     if (!allowMultiBlockMode) {
+       return 1;
+     }
+-    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads)),
++    uint32_t parallelHeadTokenGroups = batchSize * nbKHeads;
++#if SPEC_DEC && USE_PTH_SCALE
++    // Speculative decode and prefill already expose one independent grid-Y
++    // block per group of query rows. Account for that parallelism before
++    // splitting the KV sequence. This preserves the decode/MTP behavior for
++    // q<=4 on Qwen (one token block) while preventing long prefill chunks from
++    // multiplying scratch by both query-token blocks and SM-count splits.
++    parallelHeadTokenGroups *= nbTokenBlocksPerGrp;
++#endif
++    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / parallelHeadTokenGroups),
+                               divUp(maxSeqLen, ctaTile.x));
+   }();
+ #if SPEC_DEC
+-  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
+   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
+ #else
+   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
+@@ -3076,7 +3328,12 @@
+                                     kSfCacheVLLM,    vSfCacheVLLM,
+ #endif
+                                     kvCachePageList, seqLen,       maxNbPagesPerSeq};
+-  // Convert stride from elements to Heads
++#if USE_PTH_SCALE
++  KVCacheStrideType const stride_page_in_heads = kv_stride_page;
++  KVCacheStrideType const stride_token_in_heads = kv_stride_token;
++  KVCacheStrideType const stride_head_in_heads = kv_stride_head;
++#else
++  // Convert stride from elements to Heads.
+   uint32_t const container_elems_per_head =
+       validElemsPerHead / CacheElemConverter::ElemsPerContainer;
+   uint32_t const stride_page_in_heads =
+@@ -3085,6 +3342,7 @@
+       static_cast<uint32_t>(kv_stride_token / container_elems_per_head);
+   uint32_t const stride_head_in_heads =
+       static_cast<uint32_t>(kv_stride_head / container_elems_per_head);
++#endif
+ #if ENABLE_4BIT_KV_CACHE
+   uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+   uint32_t const sf_stride_page_in_heads =
+@@ -3113,6 +3371,11 @@
+                      mask,
+ #endif
+                      attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
++#if USE_PTH_SCALE
++                     kPthScaleVLLM, vPthScaleVLLM, k_pth_stride_page,
++                     k_pth_stride_token, k_pth_stride_head, v_pth_stride_page,
++                     v_pth_stride_token, v_pth_stride_head,
++#endif
+                      stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
+ #if ENABLE_4BIT_KV_CACHE
+                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
+--- a/flashinfer/data/csrc/xqa/xqa_wrapper.cu
++++ b/flashinfer/data/csrc/xqa/xqa_wrapper.cu
+@@ -73,6 +73,17 @@
+   uint64_t kv_stride_page = kCacheVLLM.stride(0);
+   uint64_t kv_stride_token = kCacheVLLM.stride(-3);
+   uint64_t kv_stride_head = kCacheVLLM.stride(-2);
++#if USE_PTH_SCALE && PTH_FIXED_K8_COPY
++  // Defense for direct JIT/native callers, before any kernel launch.
++  // Reject incompatible layouts before launching the fixed-copy kernel.
++  static_assert(cacheElemSize == 1);
++  TVM_FFI_ICHECK(kCacheVLLM.stride(-1) == 1 &&
++                kCacheVLLM.stride(0) > 0 && kCacheVLLM.stride(-3) > 0 &&
++                kCacheVLLM.stride(-2) > 0 &&
++                ((reinterpret_cast<uintptr_t>(kCacheVLLM.data_ptr()) |
++                  kv_stride_page | kv_stride_token | kv_stride_head) & 7u) == 0)
++      << "Fixed 8-byte K copies require an 8-byte-aligned INT8 K base and strides";
++#endif
+ #if ENABLE_4BIT_KV_CACHE
+   uint64_t sf_stride_page = kv_stride_page;
+   uint64_t sf_stride_token = kv_stride_token;
+@@ -97,6 +108,16 @@
+ 
+   void* kSfCachePtr = kSfCacheVLLM.has_value() ? kSfCacheVLLM.value().data_ptr() : nullptr;
+   void* vSfCachePtr = vSfCacheVLLM.has_value() ? vSfCacheVLLM.value().data_ptr() : nullptr;
++#if USE_PTH_SCALE
++  TVM_FFI_ICHECK(kSfCacheVLLM.has_value() && vSfCacheVLLM.has_value())
++      << "INT8 per-token/head XQA requires K and V scale caches";
++  uint64_t const k_pth_stride_page = kSfCacheVLLM.value().stride(0);
++  uint64_t const k_pth_stride_token = kSfCacheVLLM.value().stride(-2);
++  uint64_t const k_pth_stride_head = kSfCacheVLLM.value().stride(-1);
++  uint64_t const v_pth_stride_page = vSfCacheVLLM.value().stride(0);
++  uint64_t const v_pth_stride_token = vSfCacheVLLM.value().stride(-2);
++  uint64_t const v_pth_stride_head = vSfCacheVLLM.value().stride(-1);
++#endif
+ 
+ #if USE_SM90_MHA
+   if (run_sm90_fp8_mha) {
+@@ -141,6 +162,12 @@
+                       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
+                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+                       kvCacheScale, kvScalePtr,
++#if USE_PTH_SCALE
++                      reinterpret_cast<float const*>(kSfCachePtr),
++                      reinterpret_cast<float const*>(vSfCachePtr), k_pth_stride_page,
++                      k_pth_stride_token, k_pth_stride_head, v_pth_stride_page,
++                      v_pth_stride_token, v_pth_stride_head,
++#endif
+ #if SPEC_DEC
+                       qSeqLen, qCuSeqLensPtr, maskPtr,
+ #endif

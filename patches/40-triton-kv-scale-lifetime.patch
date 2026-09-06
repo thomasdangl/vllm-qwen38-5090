@@ -1,0 +1,57 @@
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -436,6 +436,7 @@
+     # Per-token-head quant: scale views carved from inline head padding.
+     _k_scale_cache: torch.Tensor | None = None
+     _v_scale_cache: torch.Tensor | None = None
++    _pth_cache_signature: tuple[object, ...] | None = None
+ 
+     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
+         """Extract per-head scale views from the padded content dimension.
+@@ -451,8 +452,27 @@
+ 
+         Scale shape: ``(num_blocks, block_size, num_kv_heads)``
+         """
+-        if self._k_scale_cache is not None:
++        signature = (
++            kv_cache.untyped_storage().data_ptr(),
++            kv_cache.storage_offset(),
++            tuple(kv_cache.shape),
++            tuple(kv_cache.stride()),
++            kv_cache.dtype,
++            kv_cache.device,
++        )
++        if (
++            self._pth_cache_signature == signature
++            and self._k_scale_cache is not None
++            and self._v_scale_cache is not None
++        ):
+             return
++
++        # Model profiling and CUDA-graph setup may use a temporary KV tensor
++        # before the real cache is bound. Never retain scale views into that
++        # old allocation: the writer would combine the new K/V pointers with
++        # stale scale pointers and can write out of bounds on the first request.
++        self._k_scale_cache = None
++        self._v_scale_cache = None
+         from vllm.utils.torch_utils import get_dtype_size
+ 
+         num_blocks, nkv, block_size, content = kv_cache.shape
+@@ -499,6 +519,7 @@
+             storage_offset=v_scale_off_f32,
+         )
+         self._v_scale_cache.fill_(1.0)
++        self._pth_cache_signature = signature
+ 
+     def fused_output_quant_supported(self, quant_key: QuantKey):
+         return quant_key == kFp8StaticTensorSym
+@@ -580,6 +601,9 @@
+ 
+         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
++        self._k_scale_cache = None
++        self._v_scale_cache = None
++        self._pth_cache_signature = None
+ 
+         # Enable tensor descriptors for Q/K/V load/store on platforms that
+         # benefit from HW 2D block reads (Intel XPU).  The dead branch

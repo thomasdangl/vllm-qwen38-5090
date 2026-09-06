@@ -1,0 +1,121 @@
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -128,6 +128,7 @@
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
++    VLLM_USE_HOST_MAPPED_EMBEDDINGS: bool = False
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+@@ -1207,6 +1208,12 @@
+     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
+         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+     ),
++    # Keep compressed input-embedding weights in pinned system RAM and expose
++    # them to CUDA kernels through a UVA view. This is opt-in because it trades
++    # a small amount of PCIe bandwidth for GPU memory.
++    "VLLM_USE_HOST_MAPPED_EMBEDDINGS": lambda: bool(
++        int(os.getenv("VLLM_USE_HOST_MAPPED_EMBEDDINGS", "0"))
++    ),
+     # Select the GDN MTP decode implementation. "cuda" uses the fused decode
+     # kernel where supported and falls back to "triton" otherwise; setting it
+     # explicitly to "cuda" raises when unsupported.
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_embedding.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_embedding.py
+@@ -10,6 +10,8 @@
+ import torch
+ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+ 
++from vllm import envs
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+ from vllm.model_executor.parameter import (
+     BasevLLMParameter,
+@@ -18,8 +20,56 @@
+     PackedvLLMParameter,
+ )
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+ 
+ __all__ = ["CompressedTensorsEmbeddingWNA16Int"]
++
++logger = init_logger(__name__)
++
++
++def _move_parameter_to_pinned_uva(parameter: torch.nn.Parameter) -> int:
++    """Move one loaded CUDA parameter to pinned host memory.
++
++    The Parameter keeps a CUDA UVA view so existing Triton kernels, CUDA graph
++    capture, device checks, and MTP weight sharing continue to see a CUDA
++    tensor. The physical storage is page-locked system RAM.
++    """
++    if getattr(parameter, "_vllm_host_mapped_embedding", False):
++        return 0
++    if parameter.device.type != "cuda":
++        raise RuntimeError(
++            "VLLM_USE_HOST_MAPPED_EMBEDDINGS requires CUDA-loaded embedding "
++            f"weights, got {parameter.device}."
++        )
++
++    device_data = parameter.data
++    cpu_data = torch.empty_strided(
++        size=device_data.size(),
++        stride=device_data.stride(),
++        dtype=device_data.dtype,
++        layout=device_data.layout,
++        device="cpu",
++        pin_memory=True,
++    )
++    cpu_data.copy_(device_data, non_blocking=False)
++    if not cpu_data.is_pinned():
++        raise RuntimeError(
++            "Failed to allocate pinned storage for host-mapped embeddings."
++        )
++
++    accelerator_view = get_accelerator_view_from_cpu_tensor(cpu_data)
++    if accelerator_view.device.type != "cuda":
++        raise RuntimeError(
++            "Host-mapped embedding storage did not produce a CUDA UVA view."
++        )
++
++    parameter.data = accelerator_view
++    # Keep the CPU allocation alive explicitly. The CUDA view's storage also
++    # owns it, but this makes the lifetime contract unambiguous.
++    parameter._vllm_host_mapped_cpu_data = cpu_data
++    parameter._vllm_host_mapped_embedding = True
++    parameter._vllm_is_uva_offloaded = True
++    return cpu_data.numel() * cpu_data.element_size()
+ 
+ 
+ @triton.jit
+@@ -154,7 +204,28 @@
+         layer.register_parameter("weight_shape", weight_shape)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        pass
++        if not envs.VLLM_USE_HOST_MAPPED_EMBEDDINGS:
++            return
++        if envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY:
++            raise RuntimeError(
++                "VLLM_USE_HOST_MAPPED_EMBEDDINGS is incompatible with "
++                "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1."
++            )
++        if envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA:
++            raise RuntimeError(
++                "VLLM_USE_HOST_MAPPED_EMBEDDINGS is incompatible with "
++                "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1."
++            )
++
++        mapped_bytes = _move_parameter_to_pinned_uva(layer.weight_packed)
++        mapped_bytes += _move_parameter_to_pinned_uva(layer.weight_scale)
++        layer._vllm_uses_host_mapped_embedding = True
++        if mapped_bytes:
++            logger.info(
++                "Host-mapped compressed embedding weights: %.2f MiB pinned "
++                "system RAM, CUDA UVA access enabled",
++                mapped_bytes / (1024 * 1024),
++            )
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+         ids = input_.reshape(-1).contiguous()
