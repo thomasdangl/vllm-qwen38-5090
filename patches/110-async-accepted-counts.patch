@@ -1,0 +1,29 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1650,7 +1650,9 @@
+                 num_reqs=num_reqs,
+                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                 num_accepted_tokens_cpu_tensor=(
+-                    self.input_batch.num_accepted_tokens_cpu_tensor
++                    self.num_accepted_tokens.cpu
++                    if self.use_async_scheduling
++                    else self.input_batch.num_accepted_tokens_cpu_tensor
+                 ),
+                 input_batch=self.input_batch,
+                 kv_cache_config=self.kv_cache_config,
+@@ -2175,12 +2177,12 @@
+         if needs_cpu_accepted_counts:
+             assert self.num_accepted_tokens_event is not None
+             self.num_accepted_tokens_event.synchronize()
+-            # Async mode: condense() reordered indices, use prev_positions mapping
+-            if self.use_async_scheduling and prev_req_id_to_index:
++            # Remap the completed snapshot, including an empty previous batch.
++            if self.use_async_scheduling:
+                 prev_idx = self.prev_positions.np[:num_reqs]
+                 new_mask = prev_idx < 0
+                 self.num_accepted_tokens.np[:num_reqs] = (
+-                    self.input_batch.num_accepted_tokens_cpu[
++                    self.num_accepted_tokens.np[
+                         np.where(new_mask, 0, prev_idx)
+                     ]
+                 )

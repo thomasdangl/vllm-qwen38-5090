@@ -1,0 +1,1119 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -608,6 +608,10 @@
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    # Exclusive image encoding: retain CPU mirrors and swap physical GPU backing.
++    "VLLM_VISION_WEIGHT_SWAP": lambda: os.getenv("VLLM_VISION_WEIGHT_SWAP", "0") == "1",
++    "VLLM_VISION_SWAP_RESERVE_MIB": lambda: int(os.getenv("VLLM_VISION_SWAP_RESERVE_MIB", "1536")),
++    "VLLM_VISION_SWAP_COMPACT_WEIGHTS": lambda: os.getenv("VLLM_VISION_SWAP_COMPACT_WEIGHTS", "1") == "1",
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -767,6 +767,10 @@
+         config: Qwen3_5Config = vllm_config.model_config.hf_config
+         quant_config = vllm_config.quant_config
+         multimodal_config = vllm_config.model_config.multimodal_config
++        from .qwen3_5_vision_swap import validate_config
++
++        self._vision_swap_requested = validate_config(vllm_config)
++        self._vision_weight_swap = None
+ 
+         self.config = config
+         self.model_config = vllm_config.model_config
+@@ -804,6 +808,22 @@
+         self.make_empty_intermediate_tensors = (
+             self.language_model.make_empty_intermediate_tensors
+         )
++
++    def process_weights_after_loading(self) -> None:
++        from .qwen3_5_vision_swap import install
++
++        install(self)
++
++    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
++        swap = self._vision_weight_swap
++        # Precomputed image embeddings do not need vision weights. This wrapper
++        # also covers the real encoder call during native memory profiling.
++        pixels = any(kwargs.get(key) is not None for key in
++                     ("pixel_values", "pixel_values_videos"))
++        if swap is not None and pixels:
++            with swap.encoding():
++                return super().embed_multimodal(**kwargs)
++        return super().embed_multimodal(**kwargs)
+ 
+     def embed_input_ids(
+         self,
+@@ -863,6 +883,9 @@
+                     LLM. `None` if no videos are passed.
+         """
+ 
++        if self._vision_weight_swap is not None:
++            self._vision_weight_swap.assert_decoder_ready()
++
+         if intermediate_tensors is not None:
+             inputs_embeds = None
+ 
+diff --git a/vllm/model_executor/models/qwen3_5_vision_swap.py b/vllm/model_executor/models/qwen3_5_vision_swap.py
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_5_vision_swap.py
+@@ -0,0 +1,770 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Exclusive vision encoding with address-preserving decoder weight eviction.
++
++Pinned to the Qwen3.5 dense/Humming, single-worker execution path. Neither the
++KV cache, GDN state, MTP model nor Humming locks enter either arena. Arenas keep
++their PyTorch storage and CUDA virtual addresses alive while their physical
++backing is absent. Never use the allocator's global sleep/wake operations here.
++"""
++
++from __future__ import annotations
++
++import gc
++import logging
++import os
++import re
++import threading
++import time
++import ctypes
++from pathlib import Path
++from contextlib import contextmanager
++from dataclasses import dataclass
++
++logger = logging.getLogger(__name__)
++MIB = 1024 * 1024
++
++
++def enabled() -> bool:
++    value = os.environ.get("VLLM_VISION_WEIGHT_SWAP", "0")
++    if value not in ("0", "1"):
++        raise ValueError("VLLM_VISION_WEIGHT_SWAP must be 0 or 1")
++    return value == "1"
++
++
++def reserve_bytes() -> int:
++    value = int(os.environ.get("VLLM_VISION_SWAP_RESERVE_MIB", "1536"))
++    if value < 0:
++        raise ValueError("VLLM_VISION_SWAP_RESERVE_MIB must be nonnegative")
++    return value * MIB
++
++
++def compact_weights_enabled() -> bool:
++    value = os.environ.get("VLLM_VISION_SWAP_COMPACT_WEIGHTS", "1")
++    if value not in ("0", "1"):
++        raise ValueError("VLLM_VISION_SWAP_COMPACT_WEIGHTS must be 0 or 1")
++    return value == "1"
++
++
++def physical_memory_breakdown(result, decoder_bytes, resident_bytes=0, drafter_bytes=0):
++    """Reconcile measured physical growth without changing the KV budget.
++
++    The snapshots already exist. No allocator mutation, cache clearing, or
++    additional GPU allocation is required to distinguish live tensors, retained
++    allocator pages, and driver/library allocations. Decoder VMM backing is
++    reported separately because PyTorch does not track it.
++    """
++    before, after = result.before_create, result.after_profile
++    live_growth = after.torch_allocated - before.torch_allocated
++    unused_before = before.torch_memory - before.torch_allocated
++    unused_after = after.torch_memory - after.torch_allocated
++    unused_growth = unused_after - unused_before
++    outside_growth = after.non_torch_memory - before.non_torch_memory
++    return dict(
++        torch_live_growth_mib=live_growth / MIB,
++        torch_unused_reserved_growth_mib=unused_growth / MIB,
++        decoder_vmm_mib=decoder_bytes / MIB,
++        compact_resident_vmm_mib=resident_bytes / MIB,
++        compact_mtp_vmm_mib=drafter_bytes / MIB,
++        other_non_torch_growth_mib=(outside_growth - decoder_bytes - resident_bytes - drafter_bytes) / MIB,
++        accounted_growth_mib=(live_growth + unused_growth + outside_growth) / MIB,
++        reported_consumed_mib=result.total_consumed / MIB,
++        after_torch_allocated_mib=after.torch_allocated / MIB,
++        after_torch_reserved_mib=after.torch_memory / MIB,
++        after_torch_unused_reserved_mib=unused_after / MIB,
++        after_non_torch_mib=after.non_torch_memory / MIB,
++        before_create_non_torch_mib=before.non_torch_memory / MIB,
++    )
++
++
++def validate_config(config) -> bool:
++    """Fail before model loading for unsupported active configurations."""
++    if not enabled():
++        return False
++    mm = config.model_config.multimodal_config
++    if all(mm.get_limit_per_prompt(m) == 0 for m in ("image", "video")):
++        logger.info("Vision weight swap inactive: vision tower is disabled.")
++        return False
++    p, c = config.parallel_config, config.compilation_config
++    problems = []
++    if config.model_config.hf_config.model_type != "qwen3_5":
++        problems.append("dense Qwen3.5 architecture required")
++    if any(getattr(p, key, 1) != 1 for key in (
++        "tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size",
++        "prefill_context_parallel_size", "decode_context_parallel_size",
++    )):
++        problems.append("TP/PP/DP/PCP/DCP must all be 1")
++    if getattr(p, "enable_dbo", False) or getattr(p, "use_ubatching", False):
++        problems.append("overlapping worker microbatches are unsupported")
++    if int(c.mode) != 0:
++        problems.append('compilation mode must be "NONE" (decoder graphs remain supported)')
++    if c.compile_mm_encoder or c.cudagraph_mm_encoder:
++        problems.append("vision encoder compilation and encoder CUDA graphs must be off")
++    if mm.skip_mm_profiling:
++        problems.append("remove --skip-mm-profiling so image outputs and peaks are budgeted")
++    if mm.mm_encoder_only:
++        problems.append("--mm-encoder-only has no decoder weights to borrow")
++    if config.lora_config is not None or config.weight_transfer_config is not None:
++        problems.append("mutable weights (LoRA/weight transfer) are unsupported")
++    if config.model_config.enable_sleep_mode or config.model_config.enable_cumem_allocator:
++        problems.append("global sleep mode/cumem allocator must be off")
++    offload = config.offload_config
++    if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
++        problems.append("generic decoder offloading must be off")
++    reserve_bytes()
++    compact_weights_enabled()
++    if problems:
++        raise ValueError("Vision weight swap: " + "; ".join(problems))
++    return True
++
++
++@dataclass(frozen=True)
++class Layout:
++    name: str
++    offset: int
++    nbytes: int
++    shape: tuple[int, ...]
++    stride: tuple[int, ...]
++    dtype: object
++
++
++def tensor_layout(tensors) -> tuple[list[Layout], int]:
++    """Pack nonoverlapping dense tensors, preserving shape AND stride for TMA."""
++    rows, offset, seen = [], 0, set()
++    for name, t in tensors:
++        # A transpose is fine; sliced, expanded and overlapping views are not.
++        expected = 1
++        for size, stride in sorted(zip(t.shape, t.stride()), key=lambda x: x[1]):
++            if size > 1:
++                if stride != expected:
++                    raise ValueError(f"Vision swap requires dense tensor storage: {name}")
++                expected *= size
++        if t.numel() == 0 or any(s < 0 for s in t.stride()):
++            raise ValueError(f"Unsupported empty/negative-stride tensor: {name}")
++        storage_id = (str(t.device), t.untyped_storage().data_ptr())
++        if storage_id in seen:
++            raise ValueError(f"Unexpected shared storage in swap arena: {name}")
++        seen.add(storage_id)
++        offset = (offset + 255) // 256 * 256
++        nbytes = t.numel() * t.element_size()
++        rows.append(Layout(name, offset, nbytes, tuple(t.shape), tuple(t.stride()), t.dtype))
++        offset += nbytes
++    if not rows:
++        raise ValueError("Empty vision swap arena")
++    return rows, offset
++
++
++def packed_views(slab, layouts):
++    return [
++        slab.narrow(0, row.offset, row.nbytes).view(row.dtype).as_strided(
++            row.shape, row.stride
++        ) for row in layouts
++    ]
++
++
++def stage_weights_on_host(tensors, layouts, payload_bytes, device, *, pin_memory=True):
++    """Complete the CPU snapshot before releasing any original weight storage.
++
++    This runs only during installation, before forwards or graph capture. Copy
++    physical bytes so even transposed TMA layouts need no GPU packing temporary.
++    Rebinding the existing parameters to host views releases their old CUDA
++    storage without losing parameter metadata or holding a second GPU copy.
++    """
++    import torch
++
++    host = torch.zeros(payload_bytes, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
++    for (_, tensor), row in zip(tensors, layouts):
++        host.narrow(0, row.offset, row.nbytes).copy_(
++            tensor.detach().as_strided((tensor.numel(),), (1,)).view(torch.uint8),
++            non_blocking=pin_memory,
++        )
++    torch.cuda.synchronize(device)
++    for (_, tensor), view in zip(tensors, packed_views(host, layouts)):
++        tensor.data = view
++    return host
++
++
++class Allocation:
++    """CUDA-array-interface owner; torch retains it for the storage lifetime."""
++
++    @staticmethod
++    def backing_bytes(device, requested):
++        """Query the driver granularity without reserving or mapping memory."""
++        lib = ctypes.CDLL(str(Path(__file__).with_name("libvision_swap_vmm.so")))
++        lib.vs_allocation_size.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
++        lib.vs_last_error.restype = ctypes.c_char_p
++        result = ctypes.c_size_t()
++        if lib.vs_allocation_size(device, requested, ctypes.byref(result)):
++            raise RuntimeError(lib.vs_last_error().decode())
++        return result.value
++
++    def __init__(self, device, nbytes):
++        path = Path(__file__).with_name("libvision_swap_vmm.so")
++        self.lib = ctypes.CDLL(str(path))
++        lib = self.lib
++        lib.vs_abi_version.restype = ctypes.c_int
++        if lib.vs_abi_version() != 1:
++            raise RuntimeError("Vision swap VMM library ABI mismatch")
++        lib.vs_last_error.restype = ctypes.c_char_p
++        lib.vs_allocate.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
++        for name in ("vs_evict", "vs_restore", "vs_free", "vs_address", "vs_bytes", "vs_resident"):
++            getattr(lib, name).argtypes = [ctypes.c_void_p]
++        lib.vs_address.restype = ctypes.c_uint64
++        lib.vs_bytes.restype = ctypes.c_size_t
++        self.handle = ctypes.c_void_p()
++        self._check(lib.vs_allocate(device, nbytes, ctypes.byref(self.handle)))
++        self.physical_bytes = lib.vs_bytes(self.handle)
++        self.__cuda_array_interface__ = {
++            "shape": (nbytes,), "strides": None, "typestr": "|u1",
++            "data": (lib.vs_address(self.handle), False), "version": 3,
++        }
++
++    def _check(self, code):
++        if code:
++            raise RuntimeError(self.lib.vs_last_error().decode())
++
++    @property
++    def resident(self):
++        return bool(self.lib.vs_resident(self.handle))
++
++    def evict(self):
++        self._check(self.lib.vs_evict(self.handle))
++
++    def restore(self):
++        self._check(self.lib.vs_restore(self.handle))
++
++    def close(self):
++        if self.handle:
++            self._check(self.lib.vs_free(self.handle))
++            self.handle = None
++
++    def __del__(self):
++        # Both mapped and evicted allocations have a valid destruction path.
++        handle = getattr(self, "handle", None)
++        if handle:
++            self.lib.vs_free(handle)
++            self.handle = None
++
++
++class Arena:
++    """Packed VMM weights; only swappable arenas retain a pinned CPU mirror."""
++
++    def __init__(self, name, tensors, *, swappable=True):
++        import torch
++
++        self.torch = torch
++        self.name = name
++        self.swappable = swappable
++        self.layouts, self.payload_bytes = tensor_layout(tensors)
++        self.device = tensors[0][1].device
++        if self.device.type != "cuda" or any(t.device != self.device for _, t in tensors):
++            raise ValueError("Vision swap arenas require tensors on one CUDA device")
++        if any(getattr(t, "_vllm_is_uva_offloaded", False) for _, t in tensors):
++            raise ValueError("Host-mapped tensors cannot enter a vision swap arena")
++        with torch.cuda.device(self.device):
++            torch.cuda.synchronize(self.device)
++            self.host = stage_weights_on_host(
++                tensors, self.layouts, self.payload_bytes, self.device,
++                pin_memory=swappable,
++            )
++            gc.collect()
++            # cuMemCreate is outside the PyTorch allocator: it cannot trigger
++            # that allocator's OOM retry/cache release. Return both the original
++            # weights and cached quantization temporaries to the driver first.
++            torch.cuda.empty_cache()
++            free = torch.cuda.mem_get_info(self.device)[0]
++            logger.info("Vision swap %s migration: %.2f MiB staged in %s RAM; "
++                        "%.2f MiB driver-free before VMM allocation",
++                        name, self.payload_bytes / MIB,
++                        "pinned" if swappable else "temporary pageable", free / MIB)
++            try:
++                self.allocation = Allocation(self.device.index, self.payload_bytes)
++            except RuntimeError as exc:
++                raise RuntimeError(
++                    f"Vision swap {name} migration failed after releasing original "
++                    f"weights and unused PyTorch cache: {self.payload_bytes / MIB:.2f} "
++                    f"MiB payload, {free / MIB:.2f} MiB driver-free: {exc}"
++                ) from exc
++            self.slab = torch.as_tensor(self.allocation, device=self.device)
++        if self.slab.data_ptr() != self.allocation.__cuda_array_interface__["data"][0]:
++            raise RuntimeError("PyTorch copied the VMM tensor instead of borrowing its pointer")
++        self.physical_bytes = self.allocation.physical_bytes
++        self.views = packed_views(self.slab, self.layouts)
++        self.slab.copy_(self.host, non_blocking=False)
++        torch.cuda.synchronize(self.device)
++        # Existing Parameter objects survive. Humming looks them up on each
++        # forward; TMA descriptors and decoder graphs are created after this hook.
++        self.bindings = []
++        for (name, tensor), view in zip(tensors, self.views):
++            tensor.data = view
++            self.bindings.append((name, tensor, tensor.data_ptr()))
++        if not swappable:
++            self.host = None  # No CPU mirror or transfer during inference.
++
++    @property
++    def resident(self):
++        return self.allocation.resident
++
++    def validate_bindings(self):
++        for name, tensor, ptr in self.bindings:
++            if tensor.data_ptr() != ptr:
++                raise RuntimeError(f"Weight storage replaced after vision swap setup: {name}")
++
++    def evict(self):
++        if not self.swappable:
++            raise RuntimeError("Resident compact weights cannot be evicted")
++        self.validate_bindings()
++        self.allocation.evict()
++
++    def restore(self):
++        if not self.swappable:
++            raise RuntimeError("Resident compact weights cannot be restored")
++        self.allocation.restore()
++        self.slab.copy_(self.host, non_blocking=False)
++
++
++class DeviceOps:
++    def __init__(self, device):
++        import torch
++        self.torch, self.device = torch, device
++
++    def synchronize(self):
++        self.torch.cuda.synchronize(self.device)
++
++    def empty_cache(self):
++        self.torch.cuda.empty_cache()
++
++    def free_bytes(self):
++        return self.torch.cuda.mem_get_info(self.device)[0]
++
++    def peak(self):
++        return self.torch.cuda.max_memory_allocated(self.device)
++
++    def reset_peak(self):
++        self.torch.cuda.reset_peak_memory_stats(self.device)
++
++    def capturing(self):
++        return self.torch.cuda.is_current_stream_capturing()
++
++
++class VisionSwap:
++    def __init__(self, decoder, vision, ops):
++        self.decoder, self.vision, self.ops = decoder, vision, ops
++        self.compact_resident = None
++        self.compact_drafter = None
++        self._draft_compaction_checked = False
++        self.state = "decoder"
++        self.lock = threading.RLock()
++        self.profiling = False
++        self.corrected_peak = 0
++        self.profile_phases = []
++        self.cycles = 0
++        self.last_metrics = {}
++        self.ops.synchronize()
++        self.vision.evict()
++        self.ops.empty_cache()
++
++    def assert_decoder_ready(self):
++        if self.state != "decoder":
++            raise RuntimeError(f"Decoder execution while vision swap state={self.state}")
++
++    @contextmanager
++    def worker_step(self):
++        # execute_model and sample_tokens both take this lock, including graph
++        # replay paths that bypass Python model.forward. encoding() re-enters it
++        # from preprocessing. Other worker calls wait until the restore finishes.
++        with self.lock:
++            self.assert_decoder_ready()
++            yield
++
++    @contextmanager
++    def profile_scope(self):
++        if self.profiling:
++            raise RuntimeError("Nested vision memory profiling")
++        self.corrected_peak = 0
++        self.profile_phases = []
++        self.profiling = True
++        try:
++            yield
++        finally:
++            self.profiling = False
++
++    def adjust_profile_result(self, result):
++        # VMM weights are outside PyTorch's allocator statistics.
++        # Encoder activation peaks must be reduced by the physical decoder bytes
++        # lent to the encoder, minus the vision bytes brought in. Native physical
++        # consumption after profiling already excludes the offloaded vision arena.
++        after = result.after_profile
++        peak = max(after.torch_peak, self.corrected_peak)
++        headroom = max(0, peak - after.torch_allocated)
++        result.transient_peak_headroom = headroom
++        result.non_kv_cache_memory = result.total_consumed + headroom
++        logger.info("Vision swap profile: physical non-KV %.2f MiB, transient headroom %.2f MiB",
++                    result.total_consumed / MIB, headroom / MIB)
++        logger.info("Vision swap physical breakdown: %s",
++                    physical_memory_breakdown(
++                        result, self.decoder.physical_bytes,
++                        0 if self.compact_resident is None else self.compact_resident.physical_bytes,
++                        0 if self.compact_drafter is None else self.compact_drafter.physical_bytes))
++        baseline = result.before_profile.torch_allocated
++        logger.info("Vision swap profile breakdown: %s", dict(
++            baseline_torch_mib=baseline / MIB,
++            phases=self.profile_phases,
++            decoder_phase_peak_increase_mib=(after.torch_peak - baseline) / MIB,
++            persistent_torch_increase_mib=(after.torch_allocated - baseline) / MIB,
++            corrected_peak_increase_mib=(peak - baseline) / MIB,
++        ))
++
++    @contextmanager
++    def encoding(self):
++        with self.lock:
++            self.assert_decoder_ready()
++            if self.ops.capturing():
++                raise RuntimeError("Vision weight swap cannot execute during CUDA graph capture")
++            self.decoder.validate_bindings()
++            self.vision.validate_bindings()
++            self.ops.synchronize()  # Includes prior batches, MTP and auxiliary streams.
++            started = time.perf_counter()
++            if self.profiling:
++                incoming_peak = self.ops.peak()
++                self.corrected_peak = max(self.corrected_peak, incoming_peak)
++                self.ops.reset_peak()
++            self.state = "switching"
++            failed = False
++            try:
++                self.decoder.evict()
++                self.ops.empty_cache()
++                free = self.ops.free_bytes()
++                if free < self.vision.physical_bytes:
++                    raise RuntimeError(f"Vision weights need {self.vision.physical_bytes / MIB:.1f} MiB; "
++                                       f"only {free / MIB:.1f} MiB free after decoder eviction")
++                self.vision.restore()
++                self.ops.synchronize()
++                loaded = time.perf_counter()
++                self.state = "vision"
++                yield
++                self.ops.synchronize()
++                encoded = time.perf_counter()
++            except BaseException:
++                failed = True
++                raise
++            finally:
++                try:
++                    # Even when image processing raises, never leave a worker
++                    # with unmapped decoder weights. A failed restore poisons the
++                    # worker rather than allowing a later graph replay.
++                    self.ops.synchronize()
++                    if self.profiling:
++                        lent = self.decoder.physical_bytes - self.vision.physical_bytes
++                        encoder_peak = self.ops.peak()
++                        self.corrected_peak = max(self.corrected_peak, encoder_peak - lent)
++                        self.profile_phases.append(dict(
++                            incoming_torch_peak_mib=incoming_peak / MIB,
++                            encoder_torch_peak_mib=encoder_peak / MIB,
++                            borrowed_workspace_mib=lent / MIB,
++                            corrected_encoder_peak_mib=(encoder_peak - lent) / MIB,
++                        ))
++                    if self.vision.resident:
++                        self.vision.evict()
++                    self.ops.empty_cache()
++                    if not self.decoder.resident:
++                        self.decoder.restore()
++                    self.ops.synchronize()
++                    if self.profiling:
++                        self.ops.reset_peak()
++                    self.state = "decoder"
++                except BaseException:
++                    self.state = "broken"
++                    logger.exception("Vision swap failed to restore decoder; worker must stop")
++                    raise
++            if not failed:
++                self.cycles += 1
++                ended = time.perf_counter()
++                self.last_metrics = dict(
++                    cycle=self.cycles, vision_load_ms=1000 * (loaded - started),
++                    encode_ms=1000 * (encoded - loaded),
++                    decoder_restore_ms=1000 * (ended - encoded),
++                    pause_ms=1000 * (ended - started),
++                    decoder_mib=self.decoder.physical_bytes / MIB,
++                    vision_mib=self.vision.physical_bytes / MIB,
++                    free_after_mib=self.ops.free_bytes() / MIB,
++                )
++                logger.info("Vision weight swap: %s", self.last_metrics)
++
++
++def _humming_kernel(module):
++    method = getattr(module, "quant_method", None)
++    if type(method).__name__ == "HummingLinearMethod":
++        return method
++    kernel = getattr(getattr(module, "scheme", None), "kernel", None)
++    if type(kernel).__name__ == "HummingLinearKernel":
++        return kernel
++    return None
++
++
++def select_decoder_tensors(model, target_bytes):
++    """Select whole finalized Humming MLP projections; never recurrent state."""
++    selected, total = [], 0
++    pattern = re.compile(r"language_model\.model\.layers\.\d+\.mlp\.(gate_up_proj|down_proj)$")
++    for name, module in model.named_modules():
++        if not pattern.fullmatch(name) or _humming_kernel(module) is None:
++            continue
++        tensors = list(module.named_parameters(recurse=False))
++        # The Humming lock is stored on its kernel object, not in this list.
++        allowed = {"weight", "weight_scale", "weight_scale_2", "zero_point", "bias"}
++        if any(n not in allowed for n, _ in tensors):
++            raise ValueError(f"Unrecognized Humming parameter in {name}")
++        for n, t in tensors:
++            selected.append((f"{name}.{n}", t))
++            total += t.numel() * t.element_size()
++        if total >= target_bytes:
++            return selected
++    raise ValueError(f"Only {total / MIB:.1f} MiB of supported Humming MLP weights; "
++                     f"need {target_bytes / MIB:.1f} MiB")
++
++
++def select_resident_tensors(model, decoder_tensors):
++    """Compact finalized main-decoder Humming and Marlin projections at startup.
++
++    Projection parameters are immutable here. Recurrent state, buffers, locks,
++    embeddings and MTP are deliberately outside this selection. Exclude whole
++    projections already selected for swapping; never split shared storage.
++    """
++    excluded = {id(t) for _, t in decoder_tensors}
++    selected = []
++    pattern = re.compile(r"language_model\.(model\.layers\.\d+\..+|lm_head)")
++    allowed = {"weight", "weight_scale", "weight_scale_2", "zero_point", "bias"}
++    for name, module in model.named_modules():
++        if not pattern.fullmatch(name):
++            continue
++        kernel = _humming_kernel(module)
++        if kernel is not None:
++            tensors = list(module.named_parameters(recurse=False))
++            if any(n not in allowed for n, _ in tensors):
++                raise ValueError(f"Unrecognized Humming parameter in {name}")
++        else:
++            kernel = getattr(getattr(module, "scheme", None), "kernel", None)
++            if type(kernel).__name__ != "MarlinLinearKernel":
++                continue
++            # Move finalized packed weights/scales only, using the same names
++            # Marlin's _get_weight_params reads on every forward. Workspace,
++            # sort indices, shape metadata and empty auxiliaries stay in place.
++            c = kernel.config
++            if c.weight_type.size_bits != 8 or c.group_size != 128 or c.has_g_idx or c.zero_points:
++                continue
++            if getattr(c.act_type, "itemsize", 0) != 2:
++                continue
++            names = {kernel.w_q_name, kernel.w_s_name, "bias"}
++            tensors = [(n, t) for n, t in module.named_parameters(recurse=False) if n in names]
++        if any(id(t) in excluded for _, t in tensors):
++            if not all(id(t) in excluded for _, t in tensors):
++                raise ValueError(f"Partially selected Humming projection: {name}")
++            continue
++        if any(getattr(t, "_vllm_is_uva_offloaded", False) for _, t in tensors):
++            continue
++        selected.extend((f"{name}.{n}", t) for n, t in tensors)
++    return selected
++
++
++def plan_resident_compaction(segments, candidates, backing_bytes, device, min_gain=32 * MIB):
++    """Predict whole backing chunks released, not just tensor bytes moved.
++
++    Pinned PyTorch expandable pools use 2 MiB small/20 MiB large chunks. Snapshot
++    segments describe contiguous mapped runs, so each run starts on a chunk
++    boundary. Unknown layouts, private pools and pending frees get no credit.
++    Run after synchronization/cache cleanup, before rebinding any parameter.
++    """
++    found, releasable = set(), 0
++    for segment in segments:
++        if segment["device"] != device:
++            continue
++        base, size = segment["address"], segment["total_size"]
++        selected_intervals, other_intervals = [], []
++        cursor = base
++        for block in segment["blocks"]:
++            address, length = block["address"], block["size"]
++            if address != cursor or length <= 0:
++                return dict(status="skipped_unknown_snapshot_layout")
++            cursor += length
++            if (block["state"] == "active_allocated" and address in candidates
++                    and block["requested_size"] == candidates[address]):
++                found.add(address)
++                selected_intervals.append((address - base, cursor - base))
++            elif block["state"] != "inactive":
++                other_intervals.append((address - base, cursor - base))
++        if cursor != base + size:
++            return dict(status="skipped_unknown_snapshot_layout")
++        if tuple(segment.get("segment_pool_id", (0, 0))) != (0, 0):
++            continue
++        if segment.get("is_expandable", False):
++            kind = segment["segment_type"]
++            if kind not in ("small", "large"):
++                return dict(status="skipped_unknown_snapshot_layout")
++            chunk = (2 if kind == "small" else 20) * MIB
++            if size % chunk:
++                return dict(status="skipped_unknown_snapshot_layout")
++        else:
++            chunk = size  # cudaMalloc segments can only be returned whole.
++        for start in range(0, size, chunk):
++            end = start + chunk
++            overlaps = lambda intervals: any(a < end and b > start for a, b in intervals)
++            if overlaps(selected_intervals) and not overlaps(other_intervals):
++                releasable += chunk
++    missing = set(candidates) - found
++    gain = releasable - backing_bytes
++    return dict(
++        status=("skipped_unmatched_storage" if missing else
++                "ready" if gain >= min_gain else "skipped_nonbeneficial"),
++        matched_storages=len(found), unmatched_storages=len(missing),
++        expected_released_mib=releasable / MIB,
++        expected_backing_mib=backing_bytes / MIB,
++        expected_gain_mib=gain / MIB,
++    )
++
++
++def compact_resident_weights(tensors, *, name="compact_resident"):
++    """Free fragmented allocator pages before graphs or descriptors exist."""
++    import torch
++
++    device = tensors[0][1].device
++    def snapshot():
++        torch.cuda.synchronize(device)
++        gc.collect()
++        torch.cuda.empty_cache()
++        return dict(free=torch.cuda.mem_get_info(device)[0],
++                    live=torch.cuda.memory_allocated(device),
++                    reserved=torch.cuda.memory_reserved(device))
++
++    before = snapshot()
++    _, payload = tensor_layout(tensors)
++    candidates = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for _, t in tensors}
++    plan = plan_resident_compaction(torch.cuda.memory_snapshot(), candidates,
++                                   Allocation.backing_bytes(device.index, payload), device.index)
++    plan["arena"] = name
++    logger.info("Vision swap compaction preflight: %s", plan)
++    if plan["status"] != "ready":
++        # No staging, allocation or binding changes have happened.
++        logger.info("Vision swap resident compaction skipped: keeping original GPU weights.")
++        return None, plan
++    arena = Arena(name, tensors, swappable=False)
++    after = snapshot()
++    metrics = dict(
++        arena=name,
++        tensors=len(tensors), payload_mib=arena.payload_bytes / MIB,
++        resident_vmm_mib=arena.physical_bytes / MIB,
++        driver_free_gain_mib=(after["free"] - before["free"]) / MIB,
++        unused_reserved_before_mib=(before["reserved"] - before["live"]) / MIB,
++        unused_reserved_after_mib=(after["reserved"] - after["live"]) / MIB,
++        original_torch_storage_released_mib=(before["live"] - after["live"]) / MIB,
++        cpu_mirror_retained=False,
++        preflight=plan,
++    )
++    logger.info("Vision swap resident compaction: %s", metrics)
++    if metrics["driver_free_gain_mib"] < 0:
++        raise RuntimeError("Resident compaction unexpectedly increased physical memory; "
++                           "stop before KV sizing. Relaunch with VLLM_VISION_SWAP_COMPACT_WEIGHTS=0.")
++    return arena, metrics
++
++
++def select_drafter_tensors(draft):
++    """Select private MTP projections, never its shared embedding or LM head."""
++    selected = []
++    pattern = re.compile(r"model\.layers\.\d+\..+")
++    allowed = {"weight", "weight_scale", "weight_scale_2", "zero_point", "bias"}
++    for name, module in draft.named_modules():
++        if name != "model.fc" and not pattern.fullmatch(name):
++            continue
++        if _humming_kernel(module) is not None:
++            tensors = list(module.named_parameters(recurse=False))
++            if any(n not in allowed for n, _ in tensors):
++                raise ValueError(f"Unrecognized MTP Humming parameter in {name}")
++        elif (name == "model.fc" and
++              type(getattr(module, "quant_method", None)).__name__ == "UnquantizedLinearMethod"):
++            # Qwen's fusion projection is BF16 and reads layer.weight via
++            # F.linear on every call. Do not quantize or swap it during encoding.
++            tensors = list(module.named_parameters(recurse=False))
++            if any(n not in {"weight", "bias"} or t.element_size() != 2 for n, t in tensors):
++                raise ValueError("Unsupported unquantized MTP fusion projection")
++        else:
++            continue
++        if any(getattr(t, "_vllm_is_uva_offloaded", False) for _, t in tensors):
++            raise ValueError("Host-mapped tensor in private MTP projections")
++        selected.extend((f"mtp.{name}.{n}", t) for n, t in tensors)
++    return selected
++
++
++def compact_drafter_weights(target, draft):
++    """Run after drafter loading/sharing, before either model's first forward."""
++    import torch
++
++    swap = getattr(target, "_vision_weight_swap", None)
++    if swap is None or not compact_weights_enabled() or draft is None:
++        return
++    if type(draft).__name__ != "Qwen3_5MTP":
++        logger.info("Vision swap MTP compaction skipped for %s", type(draft).__name__)
++        return
++    if swap._draft_compaction_checked:
++        raise RuntimeError("MTP compaction was already checked; weight reload is unsupported")
++    if (draft.lm_head is not target.language_model.lm_head or
++            draft.model.embed_tokens is not target.language_model.model.embed_tokens):
++        raise RuntimeError("Compact MTP weights only after sharing the target embedding and LM head")
++    tensors = select_drafter_tensors(draft)
++    swap._draft_compaction_checked = True
++    if not tensors:
++        return
++    tensor_layout(tensors)
++    selected_ids = {id(t) for _, t in tensors}
++    storage = {t.untyped_storage().data_ptr() for _, t in tensors}
++    for model in (target, draft):
++        for name, t in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers()):
++            if (t.numel() and (model is target or id(t) not in selected_ids)
++                    and t.untyped_storage().data_ptr() in storage):
++                raise ValueError(f"Private MTP weights share storage with another tensor: {name}")
++    with torch.no_grad():
++        swap.compact_drafter, swap.drafter_compaction_metrics = compact_resident_weights(
++            tensors, name="compact_mtp")
++
++
++def install(model):
++    """Called once after all quantization finalization, before any model forward."""
++    import torch
++    if not getattr(model, "_vision_swap_requested", False):
++        return
++    if getattr(model, "_vision_weight_swap", None) is not None:
++        raise RuntimeError("Vision swap does not support in-place model weight reloads")
++    vision_tensors = list(model.visual.named_parameters())
++    # Qwen's rotary tables are immutable but may be shared with other get_rope
++    # users. Keep buffers resident; offload only the tower's private parameters.
++    vision_size = sum(t.numel() * t.element_size() for _, t in vision_tensors)
++    decoder_tensors = select_decoder_tensors(model, vision_size + reserve_bytes())
++    resident_tensors = select_resident_tensors(model, decoder_tensors) if compact_weights_enabled() else []
++    all_tensors = decoder_tensors + vision_tensors + resident_tensors
++    # Validate across all three sets before any bindings change.
++    tensor_layout(all_tensors)
++    selected_ids = {id(t) for _, t in all_tensors}
++    selected_storage = {t.untyped_storage().data_ptr() for _, t in all_tensors}
++    for name, t in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers()):
++        if t.device.type == "cuda" and id(t) not in selected_ids and t.untyped_storage().data_ptr() in selected_storage:
++            raise ValueError(f"Swap weights share storage with another model tensor: {name}")
++    with torch.no_grad():
++        decoder = Arena("decoder", decoder_tensors)
++        vision = Arena("vision", vision_tensors)
++    gc.collect()
++    swap = VisionSwap(decoder, vision, DeviceOps(decoder.device))
++    if resident_tensors:
++        with torch.no_grad():
++            swap.compact_resident, swap.compaction_metrics = compact_resident_weights(resident_tensors)
++    model._vision_weight_swap = swap
++    logger.info("Vision weight swap ready: %.2f MiB vision weights off GPU; "
++                "%.2f MiB decoder weights can be evicted; %.2f MiB pinned CPU mirrors",
++                vision.physical_bytes / MIB, decoder.physical_bytes / MIB,
++                (vision.payload_bytes + decoder.payload_bytes) / MIB)
++    # Qwen's vision module already imports this backend module. Reading its
++    # global workspace does not create one or touch its tensor contents.
++    from vllm.model_executor.layers.attention import mm_encoder_attention
++    workspace = mm_encoder_attention._flashinfer_workspace_buffer
++    logger.info("Vision swap resident encoder resources: backend=%s; "
++                "FlashInfer encoder workspace=%.2f MiB; registered buffers=%.2f MiB",
++                model.visual.attn_backend,
++                0 if workspace is None else workspace.numel() * workspace.element_size() / MIB,
++                sum(t.numel() * t.element_size() for t in model.visual.buffers()
++                    if t.device.type == "cuda") / MIB)
+diff --git a/vllm/model_executor/models/vision_swap_vmm.cpp b/vllm/model_executor/models/vision_swap_vmm.cpp
+--- /dev/null
++++ b/vllm/model_executor/models/vision_swap_vmm.cpp
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: Apache-2.0
++// CUDA VMM ownership independent of PyTorch's caching allocator. No kernels,
++// no libtorch ABI, and no physical allocation is owned by two allocators.
++#include <cuda.h>
++#include <dlfcn.h>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++#include <string>
++
++namespace {
++thread_local std::string error;
++struct Driver {
++  void* library;
++#define ENTRY(name, symbol) decltype(&name) name##_fn
++  ENTRY(cuCtxGetCurrent, unused);
++  ENTRY(cuCtxPushCurrent, unused);
++  ENTRY(cuCtxPopCurrent, unused);
++  ENTRY(cuCtxSynchronize, unused);
++  ENTRY(cuMemGetAllocationGranularity, unused);
++  ENTRY(cuMemAddressReserve, unused);
++  ENTRY(cuMemAddressFree, unused);
++  ENTRY(cuMemCreate, unused);
++  ENTRY(cuMemMap, unused);
++  ENTRY(cuMemSetAccess, unused);
++  ENTRY(cuMemUnmap, unused);
++  ENTRY(cuMemRelease, unused);
++#undef ENTRY
++  Driver() {
++    library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
++    if (!library) throw std::runtime_error("Cannot load libcuda.so.1");
++#define LOAD(name, symbol) \
++    name##_fn = reinterpret_cast<decltype(name##_fn)>(dlsym(library, symbol)); \
++    if (!name##_fn) throw std::runtime_error("CUDA driver missing " symbol)
++    LOAD(cuCtxGetCurrent, "cuCtxGetCurrent");
++    LOAD(cuCtxPushCurrent, "cuCtxPushCurrent_v2");
++    LOAD(cuCtxPopCurrent, "cuCtxPopCurrent_v2");
++    LOAD(cuCtxSynchronize, "cuCtxSynchronize");
++    LOAD(cuMemGetAllocationGranularity, "cuMemGetAllocationGranularity");
++    LOAD(cuMemAddressReserve, "cuMemAddressReserve");
++    LOAD(cuMemAddressFree, "cuMemAddressFree");
++    LOAD(cuMemCreate, "cuMemCreate");
++    LOAD(cuMemMap, "cuMemMap");
++    LOAD(cuMemSetAccess, "cuMemSetAccess");
++    LOAD(cuMemUnmap, "cuMemUnmap");
++    LOAD(cuMemRelease, "cuMemRelease");
++#undef LOAD
++  }
++};
++Driver& driver() { static Driver* d = new Driver(); return *d; }
++void check(CUresult r, const char* operation) {
++  if (r != CUDA_SUCCESS)
++    throw std::runtime_error(std::string(operation) + " failed, CUDA error " + std::to_string(r));
++}
++struct Context {
++  explicit Context(CUcontext ctx) {
++    if (!ctx) throw std::runtime_error("Initialize PyTorch CUDA context before VMM allocation");
++    check(driver().cuCtxPushCurrent_fn(ctx), "cuCtxPushCurrent");
++  }
++  ~Context() { CUcontext old; driver().cuCtxPopCurrent_fn(&old); }
++};
++struct Allocation {
++  CUcontext context = nullptr;
++  CUdeviceptr address = 0;
++  CUmemGenericAllocationHandle handle = 0;
++  size_t bytes = 0;
++  int device = 0;
++  bool mapped = false;
++};
++CUmemAllocationProp properties(int device) {
++  CUmemAllocationProp p{};
++  p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++  p.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++  p.location.id = device;
++  return p;
++}
++size_t allocation_size(int device, size_t requested) {
++  auto prop = properties(device);
++  size_t granularity = 0;
++  check(driver().cuMemGetAllocationGranularity_fn(&granularity, &prop,
++        CU_MEM_ALLOC_GRANULARITY_MINIMUM), "cuMemGetAllocationGranularity");
++  if (!requested || requested > std::numeric_limits<size_t>::max() - granularity)
++    throw std::runtime_error("Invalid VMM allocation size");
++  return (requested + granularity - 1) / granularity * granularity;
++}
++void restore(Allocation& a) {
++  if (a.mapped || a.handle) throw std::runtime_error("VMM allocation is already resident");
++  auto& d = driver();
++  auto prop = properties(a.device);
++  check(d.cuMemCreate_fn(&a.handle, a.bytes, &prop, 0), "cuMemCreate");
++  try {
++    check(d.cuMemMap_fn(a.address, a.bytes, 0, a.handle, 0), "cuMemMap");
++    a.mapped = true;
++    CUmemAccessDesc access{};
++    access.location = prop.location;
++    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    check(d.cuMemSetAccess_fn(a.address, a.bytes, &access, 1), "cuMemSetAccess");
++  } catch (...) {
++    if (a.mapped) {
++      check(d.cuMemUnmap_fn(a.address, a.bytes), "cuMemUnmap after map failure");
++      a.mapped = false;
++    }
++    check(d.cuMemRelease_fn(a.handle), "cuMemRelease after map failure");
++    a.handle = 0;
++    throw;
++  }
++}
++void evict(Allocation& a) {
++  if (!a.mapped) throw std::runtime_error("VMM allocation is already evicted");
++  auto& d = driver();
++  check(d.cuCtxSynchronize_fn(), "cuCtxSynchronize");
++  check(d.cuMemUnmap_fn(a.address, a.bytes), "cuMemUnmap");
++  a.mapped = false;
++  check(d.cuMemRelease_fn(a.handle), "cuMemRelease");
++  a.handle = 0;
++}
++void release(Allocation& a) {
++  auto& d = driver();
++  if (a.mapped) evict(a);
++  if (a.handle) {
++    check(d.cuMemRelease_fn(a.handle), "cuMemRelease");
++    a.handle = 0;
++  }
++  if (a.address) {
++    check(d.cuMemAddressFree_fn(a.address, a.bytes), "cuMemAddressFree");
++    a.address = 0;
++  }
++}
++template <class F> int run(F fn) {
++  try { fn(); error.clear(); return 0; }
++  catch (const std::exception& e) { error = e.what(); return -1; }
++  catch (...) { error = "Unknown VMM error"; return -1; }
++}
++}  // namespace
++
++extern "C" {
++int vs_abi_version() { return 1; }
++const char* vs_last_error() { return error.c_str(); }
++int vs_allocation_size(int device, size_t requested, size_t* result) {
++  return run([&] { *result = allocation_size(device, requested); });
++}
++int vs_allocate(int device, size_t requested, void** result) {
++  *result = nullptr;
++  return run([&] {
++    auto a = std::make_unique<Allocation>();
++    a->device = device;
++    auto& d = driver();
++    check(d.cuCtxGetCurrent_fn(&a->context), "cuCtxGetCurrent");
++    Context ctx(a->context);
++    const size_t granularity = allocation_size(device, 1);
++    a->bytes = allocation_size(device, requested);
++    check(d.cuMemAddressReserve_fn(&a->address, a->bytes, granularity, 0, 0),
++          "cuMemAddressReserve");
++    try { restore(*a); }
++    catch (...) { release(*a); throw; }
++    *result = a.release();
++  });
++}
++int vs_evict(void* ptr) {
++  return run([&] { auto& a = *static_cast<Allocation*>(ptr); Context ctx(a.context); evict(a); });
++}
++int vs_restore(void* ptr) {
++  return run([&] { auto& a = *static_cast<Allocation*>(ptr); Context ctx(a.context); restore(a); });
++}
++int vs_free(void* ptr) {
++  if (!ptr) return 0;
++  return run([&] {
++    auto* a = static_cast<Allocation*>(ptr);
++    Context ctx(a->context);
++    release(*a);
++    delete a;
++  });
++}
++uint64_t vs_address(void* ptr) { return static_cast<Allocation*>(ptr)->address; }
++size_t vs_bytes(void* ptr) { return static_cast<Allocation*>(ptr)->bytes; }
++int vs_resident(void* ptr) { return static_cast<Allocation*>(ptr)->mapped; }
++}
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4293,6 +4293,17 @@
+         scheduler_output: "SchedulerOutput",
+         intermediate_tensors: IntermediateTensors | None = None,
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
++        swap = getattr(self.get_model(), "_vision_weight_swap", None)
++        if swap is None:
++            return self._execute_model_impl(scheduler_output, intermediate_tensors)
++        with swap.worker_step():
++            return self._execute_model_impl(scheduler_output, intermediate_tensors)
++
++    def _execute_model_impl(
++        self,
++        scheduler_output: "SchedulerOutput",
++        intermediate_tensors: IntermediateTensors | None = None,
++    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+         if self.execute_model_state is not None:
+             raise RuntimeError(
+                 "State error: sample_tokens() must be called "
+@@ -4668,6 +4679,15 @@
+ 
+     @torch.inference_mode
+     def sample_tokens(
++        self, grammar_output: "GrammarOutput | None"
++    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
++        swap = getattr(self.get_model(), "_vision_weight_swap", None)
++        if swap is None:
++            return self._sample_tokens_impl(grammar_output)
++        with swap.worker_step():
++            return self._sample_tokens_impl(grammar_output)
++
++    def _sample_tokens_impl(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+         if self.execute_model_state is None:
+@@ -5479,6 +5499,12 @@
+ 
+                 self._setup_eagle3_aux_hidden_state_outputs()
+ 
++                if getattr(self.model, "_vision_weight_swap", None) is not None:
++                    from vllm.model_executor.models.qwen3_5_vision_swap import (
++                        compact_drafter_weights,
++                    )
++                    compact_drafter_weights(self.model, self.get_draft_model())
++
+                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
+                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
+                 # actual MoE language model but don't implement
+@@ -6554,6 +6580,13 @@
+         return self._dummy_pooler_run_task(hidden_states, max_task)
+ 
+     def profile_run(self) -> None:
++        swap = getattr(self.get_model(), "_vision_weight_swap", None)
++        if swap is None:
++            return self._profile_run_impl()
++        with swap.profile_scope():
++            return self._profile_run_impl()
++
++    def _profile_run_impl(self) -> None:
+         # Profile with multimodal encoder & encoder cache.
+         if self.supports_mm_inputs:
+             mm_config = self.model_config.multimodal_config
+@@ -6611,6 +6644,14 @@
+                         )
+                         for i, output in enumerate(dummy_encoder_outputs):
+                             self.encoder_cache[f"tmp_{i}"] = output
++
++                        if getattr(self.get_model(), "_vision_weight_swap", None) is not None:
++                            # Real _execute_mm_encoder releases its batched GPU
++                            # pixels before the decoder runs. Keep the encoded
++                            # outputs cached, but do not overlap dead profiling
++                            # inputs with decoder activations. The encoder and
++                            # restoration peaks have already been recorded.
++                            del batched_dummy_mm_inputs
+ 
+         # Add `is_profile` here to pre-allocate communication buffers
+         hidden_states, last_hidden_states = self._dummy_run(
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -469,6 +469,8 @@
+         self.model_runner.update_config(overrides)
+ 
+     def reload_weights(self, *args, **kwargs) -> None:
++        if getattr(self.model_runner.get_model(), "_vision_weight_swap", None) is not None:
++            raise RuntimeError("Restart the worker to reload weights with vision weight swap")
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
+@@ -519,6 +521,10 @@
+             weights_memory=int(self.model_runner.model_memory_usage),
+         ) as profile_result:
+             self.model_runner.profile_run()
++
++        swap = getattr(self.model_runner.get_model(), "_vision_weight_swap", None)
++        if swap is not None:
++            swap.adjust_profile_result(profile_result)
+ 
+         # Profile CUDA graph memory if graphs will be captured.
+         # ROCm is included: #44825 moved the profiler to

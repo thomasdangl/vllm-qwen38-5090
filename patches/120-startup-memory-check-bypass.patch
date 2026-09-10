@@ -1,0 +1,36 @@
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import os
+ from collections import defaultdict
+ from collections.abc import Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field
+@@ -451,7 +452,7 @@
+     )
+ 
+     if init_snapshot.free_memory < requested_memory:
+-        raise ValueError(
++        message = (
+             f"Free memory on device {init_snapshot.device_} "
+             f"({format_gib(init_snapshot.free_memory)}/"
+             f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
+@@ -459,6 +460,16 @@
+             f"({cache_config.gpu_memory_utilization}, "
+             f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
+             f"utilization or reduce GPU memory used by other processes."
++        )
++        if os.environ.get("VLLM_BYPASS_STARTUP_MEMORY_CHECK") != "1":
++            raise ValueError(message)
++        logger.warning(
++            "Bypassing startup memory check: requested %s GiB, initial free "
++            "memory %s GiB (shortfall %.2f MiB). Keeping the requested "
++            "budget; subsequent memory profiling is unchanged.",
++            format_gib(requested_memory),
++            format_gib(init_snapshot.free_memory),
++            (requested_memory - init_snapshot.free_memory) / (1024 * 1024),
+         )
+ 
+     return requested_memory

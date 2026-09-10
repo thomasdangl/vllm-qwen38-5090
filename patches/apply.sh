@@ -31,6 +31,9 @@ patches=(
   "$here/80-gdn-direct-output.patch"
   "$here/90-mrope-cache-cap.patch"
   "$here/100-gdn-state-replay.patch"
+  "$here/110-async-accepted-counts.patch"
+  "$here/120-startup-memory-check-bypass.patch"
+  "$here/130-vision-weight-swap.patch"
 )
 if ! podman image exists "$1"; then
   podman pull "$1" >&2
@@ -90,6 +93,16 @@ podman run --rm --network=none --security-opt=label=disable \
   "/output/$replay_dir/replay.cu" -o "/output/$replay_dir/libgdn_replay.so" >&2
 printf '%s\n' "$replay_dir/libgdn_replay.so" >> "$build/files.list"
 
+vision_swap_dir=vllm/model_executor/models
+if [[ -f "$build/$vision_swap_dir/vision_swap_vmm.cpp" ]]; then
+  podman run --rm --network=none --security-opt=label=disable \
+    -v "$build:/output" --entrypoint nvcc "$image_id" \
+    -std=c++17 -O2 --shared -Xcompiler=-fPIC \
+    "/output/$vision_swap_dir/vision_swap_vmm.cpp" -ldl \
+    -o "/output/$vision_swap_dir/libvision_swap_vmm.so" >&2
+  printf '%s\n' "$vision_swap_dir/libvision_swap_vmm.so" >> "$build/files.list"
+fi
+
 {
   while IFS= read -r path; do
     printf '%s\0' -v "$output/$path:$site_packages/$path:ro"
@@ -100,8 +113,13 @@ printf '%s\n' "$replay_dir/libgdn_replay.so" >> "$build/files.list"
     -e VLLM_GDN_DIRECT_SCAN_OUTPUT=1 \
     -e VLLM_USE_HOST_MAPPED_EMBEDDINGS=1 \
     -e VLLM_MROPE_CACHE_CAP=1
+  if [[ -f "$build/$vision_swap_dir/qwen3_5_vision_swap.py" ]]; then
+    printf '%s\0' -e VLLM_VISION_WEIGHT_SWAP=1
+  fi
 } > "$build/podman.args"
-printf '%s\0' --kv-cache-dtype int8_per_token_head > "$build/vllm.args"
+{
+  printf '%s\0' --kv-cache-dtype int8_per_token_head
+} > "$build/vllm.args"
 chmod -R a+rX "$build"
 mv -T -- "$build" "$output"
 printf '%s\n' "$output"

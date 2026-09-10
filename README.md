@@ -1,15 +1,13 @@
 # vLLM Qwen 3.8 27B for Nvidia RTX 5090 (sm120)
 
 > [!WARNING]
-> This is both WiP and hacky.
+> This is both WiP and hacky. Don't use it on anything other than sm120.
 >
 > Don't attempt to modify vLLM launch parameters without checking against the patches.
->
-> Don't use it on anything other than sm120.
 
-## Model Weights
-
-[Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound](https://huggingface.co/Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound)
+- **Model** — [Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound](https://huggingface.co/Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound): 7.30bpw mixed INT5/6/7/8 of Qwen3.8 27B
+- **Context** — 247,808
+- **Layout** — 64 LM layers (48 GDN, 16 full attention), BF16 vision tower, MTP=3
 
 ## Patches
 
@@ -25,6 +23,9 @@ Applied by `patches/apply.sh` on vLLM `0.26.1rc1 (ba07e4a)` + FlashInfer `0.6.17
 - **80-gdn-direct-output** — GDN prefill scan writes directly into the preallocated output [memory]
 - **90-mrope-cache-cap** — cap the MRoPE cos/sin cache at `max_model_len` [memory]
 - **100-gdn-state-replay** — replace speculative GDN state blocks with state tape plus replay kernel [memory]
+- **110-async-accepted-counts** — fix accepted-token counts under async scheduling [bugfix]
+- **120-startup-memory-check-bypass** — warn instead of fail on startup free-memory check [memory]
+- **130-vision-weight-swap** — swap decoder pages for vision encoding [memory]
 
 ## Evaluation
 
